@@ -67,9 +67,10 @@ class ChatState:
         self.file_counter = 0
         self.load_data()
         if not self.messages:
-            self.add_message("System", "🚀 Добро пожаловать в Global Chat!", is_system=True)
+            self.add_message("System", "🚀 Добро пожаловать в Чат!", is_system=True)
 
-    def add_message(self, nickname: str, text: str, is_system: bool = False, file_info: Optional[Dict] = None, message_id: Optional[str] = None):
+    def add_message(self, nickname: str, text: str, is_system: bool = False, file_info: Optional[Dict] = None, 
+                   message_id: Optional[str] = None, reply_to: Optional[Dict] = None):
         if message_id is None:
             message_id = f"msg_{int(time.time() * 1000)}_{len(self.messages)}"
         message = {
@@ -78,18 +79,17 @@ class ChatState:
             "text": text,
             "timestamp": time.time(),
             "is_system": is_system,
-            "file": file_info
+            "file": file_info,
+            "reply_to": reply_to
         }
         self.messages.append(message)
         self.save_data()
         return message
 
     def delete_message(self, message_id: str, nickname: str) -> bool:
-        """Удаляет сообщение, если оно принадлежит пользователю"""
         for i, msg in enumerate(self.messages):
             if msg.get("id") == message_id:
                 if msg.get("nickname") == nickname:
-                    # Помечаем как удалённое
                     self.messages[i]["text"] = "🗑️ Сообщение удалено"
                     self.messages[i]["deleted"] = True
                     self.save_data()
@@ -194,7 +194,7 @@ chat_state = ChatState()
 # ============================================
 # FASTAPI ПРИЛОЖЕНИЕ
 # ============================================
-app = FastAPI(title="Global Chat Pro")
+app = FastAPI(title="Чат")
 
 app.add_middleware(
     CORSMiddleware,
@@ -317,6 +317,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if join_data.get("type") == "join" and join_data.get("nickname"):
                 nickname = join_data["nickname"].strip()[:20]
                 password = join_data.get("password")
+                action = join_data.get("action", "login")  # 'login' или 'register'
                 
                 if nickname.lower() == "system":
                     await websocket.send_text(json.dumps({
@@ -327,8 +328,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     return
                 
                 # Проверяем существование пользователя
-                if chat_state.user_exists(nickname):
-                    # Авторизация
+                exists = chat_state.user_exists(nickname)
+                
+                if action == "login":
+                    if not exists:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Пользователь не найден. Хотите зарегистрироваться?"
+                        }))
+                        await websocket.close(code=1008)
+                        return
                     if not password:
                         await websocket.send_text(json.dumps({
                             "type": "error",
@@ -343,8 +352,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         }))
                         await websocket.close(code=1008)
                         return
-                else:
-                    # Регистрация
+                else:  # register
+                    if exists:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Пользователь уже существует. Войдите в аккаунт."
+                        }))
+                        await websocket.close(code=1008)
+                        return
                     if not password or len(password) < MIN_PASSWORD_LENGTH:
                         await websocket.send_text(json.dumps({
                             "type": "error",
@@ -400,6 +415,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if msg_type == "message":
                         text = message_data.get("text", "").strip()
                         file_info = message_data.get("file")
+                        reply_to = message_data.get("reply_to")
                         
                         if text or file_info:
                             if chat_state.is_rate_limited(websocket):
@@ -409,7 +425,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 }))
                                 continue
                             
-                            msg = chat_state.add_message(nickname, text, file_info=file_info)
+                            msg = chat_state.add_message(nickname, text, file_info=file_info, reply_to=reply_to)
                             await broadcast_message(msg)
                     
                     elif msg_type == "delete":
@@ -432,7 +448,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         message_id = message_data.get("message_id")
                         new_text = message_data.get("text", "").strip()
                         if message_id and new_text:
-                            # Находим и редактируем сообщение
                             for msg in chat_state.messages:
                                 if msg.get("id") == message_id and msg.get("nickname") == nickname:
                                     msg["text"] = new_text
@@ -444,9 +459,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     elif msg_type == "mention":
                         target = message_data.get("target")
+                        reply_to_msg = message_data.get("reply_to")
                         if target:
-                            # Отправляем уведомление конкретному пользователю
-                            await send_mention_notification(nickname, target, message_data.get("text", ""))
+                            await send_mention_notification(nickname, target, message_data.get("text", ""), reply_to_msg)
                     
                 except json.JSONDecodeError:
                     pass
@@ -501,22 +516,21 @@ async def broadcast_message(message: dict, is_delete: bool = False, is_edit: boo
         if conn in chat_state.active_connections:
             del chat_state.active_connections[conn]
 
-async def send_mention_notification(from_user: str, to_user: str, text: str):
-    """Отправляет уведомление о упоминании"""
+async def send_mention_notification(from_user: str, to_user: str, text: str, reply_to: Optional[Dict] = None):
     notification = {
         "type": "mention",
         "from": from_user,
         "to": to_user,
         "text": text,
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "reply_to": reply_to
     }
     
     data = json.dumps(notification)
     for connection, user_data in chat_state.active_connections.items():
-        if user_data.get("nickname") == to_user:
+        if user_data.get("nickname") == to_user or to_user == "all":
             try:
                 await connection.send_text(data)
-                break
             except Exception:
                 pass
 
@@ -544,7 +558,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-    <title>Global Chat</title>
+    <title>Чат</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
@@ -564,6 +578,7 @@ HTML_TEMPLATE = """
         .login-card .btn-link { background: none; border: none; color: #8e8ea0; font-size: 0.85rem; cursor: pointer; transition: color 0.3s; margin-top: 0.75rem; display: block; width: 100%; text-align: center; }
         .login-card .btn-link:hover { color: #e4e4e7; }
         .login-card .error { color: #f87171; font-size: 0.85rem; margin-top: 0.25rem; display: none; }
+        .login-card .info-text { color: #60a5fa; font-size: 0.85rem; margin-top: 0.25rem; display: none; text-align: center; }
         
         /* Chat */
         #chat-screen { display: none; flex-direction: column; height: 100vh; background: #0e0e10; }
@@ -608,7 +623,11 @@ HTML_TEMPLATE = """
         .message .content .msg-actions button:hover { color: #e4e4e7; background: rgba(255,255,255,0.05); }
         .message .content .msg-actions .delete-btn:hover { color: #f87171; }
         .message .content .msg-actions .edit-btn:hover { color: #60a5fa; }
+        .message .content .msg-actions .reply-btn:hover { color: #a78bfa; }
         .message .content .msg-edit-indicator { color: #6e6e80; font-size: 0.65rem; font-style: italic; margin-left: 0.5rem; }
+        .message .content .reply-indicator { background: rgba(255,255,255,0.04); padding: 0.2rem 0.5rem; border-radius: 0.25rem; border-left: 2px solid #5865f2; margin-bottom: 0.15rem; font-size: 0.75rem; color: #8e8ea0; }
+        .message .content .reply-indicator .reply-nickname { font-weight: 500; color: #a78bfa; }
+        .message .content .reply-indicator .reply-text { color: #6e6e80; }
         .message.system { justify-content: center; }
         .message.system .content .msg-text { color: #6e6e80; font-size: 0.8rem; font-style: italic; text-align: center; }
         .message.system .avatar { display: none; }
@@ -623,9 +642,13 @@ HTML_TEMPLATE = """
         .file-attachment .download-link:hover { color: #7c6df0; }
         .message-image { max-width: 280px; max-height: 280px; border-radius: 0.5rem; cursor: pointer; margin-top: 0.2rem; transition: transform 0.2s; border: 1px solid rgba(255,255,255,0.04); }
         .message-image:hover { transform: scale(1.02); }
+        .message-image-wrapper { position: relative; display: inline-block; }
+        .message-image-wrapper .download-btn { position: absolute; bottom: 0.5rem; right: 0.5rem; background: rgba(0,0,0,0.7); color: white; border: none; border-radius: 0.5rem; padding: 0.3rem 0.6rem; font-size: 0.7rem; cursor: pointer; transition: all 0.3s; opacity: 0; }
+        .message-image-wrapper:hover .download-btn { opacity: 1; }
+        .message-image-wrapper .download-btn:hover { background: rgba(0,0,0,0.9); }
         
-        .input-area { background: rgba(30,30,46,0.95); backdrop-filter: blur(10px); border-top: 1px solid rgba(255,255,255,0.04); padding: 0.6rem 1rem; display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; }
-        .input-area .input-wrapper { flex: 1; display: flex; align-items: center; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 0.75rem; padding: 0 0.5rem; transition: all 0.3s; }
+        .input-area { background: rgba(30,30,46,0.95); backdrop-filter: blur(10px); border-top: 1px solid rgba(255,255,255,0.04); padding: 0.6rem 1rem; display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
+        .input-area .input-wrapper { flex: 1; display: flex; align-items: center; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 0.75rem; padding: 0 0.5rem; transition: all 0.3s; min-width: 100px; }
         .input-area .input-wrapper:focus-within { border-color: #5865f2; box-shadow: 0 0 0 3px rgba(88,101,242,0.1); }
         .input-area .input-wrapper .icon-btn { background: none; border: none; color: #6e6e80; font-size: 1rem; cursor: pointer; padding: 0.4rem; border-radius: 0.4rem; transition: all 0.3s; }
         .input-area .input-wrapper .icon-btn:hover { color: #e4e4e7; background: rgba(255,255,255,0.05); }
@@ -633,9 +656,11 @@ HTML_TEMPLATE = """
         .input-area .input-wrapper input:focus { outline: none; }
         .input-area .input-wrapper input::placeholder { color: #6e6e80; }
         .input-area .input-wrapper input:disabled { opacity: 0.5; cursor: not-allowed; }
+        .input-area .input-wrapper input.editing { border-color: #f59e0b; }
         .input-area .btn-send { background: linear-gradient(135deg, #5865f2, #7c6df0); color: white; padding: 0.6rem 1.2rem; border: none; border-radius: 0.75rem; font-weight: 600; font-size: 0.9rem; cursor: pointer; transition: all 0.3s; white-space: nowrap; }
         .input-area .btn-send:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(88,101,242,0.3); }
         .input-area .btn-send:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+        .input-area .btn-send.editing { background: linear-gradient(135deg, #f59e0b, #fbbf24); }
         
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(8px); z-index: 1000; justify-content: center; align-items: center; }
         .modal.active { display: flex; }
@@ -662,7 +687,6 @@ HTML_TEMPLATE = """
         .profile-modal .btn-group { display: flex; gap: 0.75rem; margin-top: 1.5rem; }
         #profile-message { margin-top: 0.75rem; font-size: 0.85rem; }
         
-        /* User profile view modal */
         .user-profile-modal .modal-content { background: #1e1e2e; color: #e4e4e7; padding: 2rem; border-radius: 1rem; max-width: 400px; width: 90%; text-align: center; }
         .user-profile-modal .modal-content .big-avatar { width: 80px; height: 80px; border-radius: 50%; object-fit: cover; margin: 0 auto 1rem; background: #2a2a3a; }
         .user-profile-modal .modal-content .user-name { font-size: 1.3rem; font-weight: 600; margin-bottom: 0.25rem; }
@@ -672,7 +696,6 @@ HTML_TEMPLATE = """
         .user-profile-modal .modal-content .user-contact i { margin-right: 0.5rem; }
         .user-profile-modal .modal-content .btn-close { margin-top: 1.5rem; }
         
-        /* Mention highlight */
         .mention-highlight { background: rgba(88,101,242,0.2); padding: 0.1rem 0.3rem; border-radius: 0.25rem; }
         .message.mentioned { background: rgba(88,101,242,0.05); border-left: 3px solid #5865f2; padding-left: 0.5rem; }
         
@@ -680,6 +703,12 @@ HTML_TEMPLATE = """
         .toast .toast-title { font-weight: 600; font-size: 0.9rem; color: #a78bfa; }
         .toast .toast-text { font-size: 0.85rem; color: #d4d4d8; margin-top: 0.25rem; }
         @keyframes slideIn { from { opacity: 0; transform: translateX(50px); } to { opacity: 1; transform: translateX(0); } }
+        
+        /* Context Menu */
+        .context-menu { display: none; position: fixed; background: #1e1e2e; border: 1px solid rgba(255,255,255,0.06); border-radius: 0.5rem; padding: 0.3rem; min-width: 180px; z-index: 3000; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+        .context-menu .menu-item { padding: 0.4rem 0.8rem; cursor: pointer; border-radius: 0.25rem; font-size: 0.85rem; color: #d4d4d8; transition: all 0.2s; display: flex; align-items: center; gap: 0.5rem; }
+        .context-menu .menu-item:hover { background: rgba(255,255,255,0.05); }
+        .context-menu .menu-item i { width: 18px; color: #6e6e80; }
         
         @media (max-width: 640px) {
             .chat-header { padding: 0.5rem 0.75rem; }
@@ -701,11 +730,12 @@ HTML_TEMPLATE = """
     <!-- Login Screen -->
     <div id="login-screen">
         <div class="login-card">
-            <h1>💬 Global Chat</h1>
+            <h1>💬 Чат</h1>
             <p class="subtitle">Войдите или зарегистрируйтесь</p>
             <input type="text" id="login-nickname" placeholder="Никнейм" maxlength="20" autofocus>
-            <input type="password" id="login-password" placeholder="Пароль (минимум 4 символа для регистрации)">
+            <input type="password" id="login-password" placeholder="Пароль">
             <div id="login-error" class="error"></div>
+            <div id="login-info" class="info-text"></div>
             <button class="btn-join" id="login-btn">Войти</button>
             <button class="btn-link" id="switch-to-register">Нет аккаунта? Зарегистрироваться</button>
         </div>
@@ -730,7 +760,7 @@ HTML_TEMPLATE = """
     <div id="chat-screen">
         <div class="chat-header">
             <div class="left">
-                <span class="title">💬 Global Chat</span>
+                <span class="title">💬 Чат</span>
                 <span class="online-badge">
                     <span class="dot"></span>
                     <span id="online-count">0</span>
@@ -760,6 +790,11 @@ HTML_TEMPLATE = """
     <div class="modal" id="image-modal">
         <span class="modal-close" id="modal-close">&times;</span>
         <img class="modal-content" id="modal-image">
+        <div style="position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); z-index: 1001;">
+            <a id="image-download-link" href="#" download class="btn btn-primary" style="padding: 0.5rem 1.5rem; background: rgba(0,0,0,0.7); color: white; border-radius: 0.5rem; text-decoration: none;">
+                <i class="fas fa-download"></i> Скачать
+            </a>
+        </div>
     </div>
 
     <!-- Profile Modal (self) -->
@@ -801,7 +836,7 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- User Profile View Modal (other users) -->
+    <!-- User Profile View Modal -->
     <div class="modal user-profile-modal" id="user-profile-modal">
         <div class="modal-content">
             <img id="user-profile-avatar" class="big-avatar" src="" alt="Avatar">
@@ -812,6 +847,13 @@ HTML_TEMPLATE = """
             <div class="user-contact" id="user-profile-email"><i class="fas fa-envelope"></i> <span>—</span></div>
             <button class="btn btn-secondary btn-close" id="user-profile-close">Закрыть</button>
         </div>
+    </div>
+
+    <!-- Context Menu -->
+    <div class="context-menu" id="context-menu">
+        <div class="menu-item" data-action="reply"><i class="fas fa-reply"></i> Ответить</div>
+        <div class="menu-item" data-action="profile"><i class="fas fa-user"></i> Профиль</div>
+        <div class="menu-item" data-action="copy"><i class="fas fa-copy"></i> Копировать</div>
     </div>
 
     <!-- Hidden file inputs -->
@@ -831,6 +873,8 @@ HTML_TEMPLATE = """
             maxReconnectAttempts: 10,
             profile: null,
             editingMessageId: null,
+            replyingTo: null,
+            contextTarget: null,
         };
 
         // ============================================
@@ -846,6 +890,7 @@ HTML_TEMPLATE = """
         const loginPassword = $('login-password');
         const loginBtn = $('login-btn');
         const loginError = $('login-error');
+        const loginInfo = $('login-info');
         const switchToRegister = $('switch-to-register');
         const switchToLogin = $('switch-to-login');
         const regNickname = $('reg-nickname');
@@ -895,6 +940,10 @@ HTML_TEMPLATE = """
         const imageModal = $('image-modal');
         const modalImage = $('modal-image');
         const modalClose = $('modal-close');
+        const imageDownloadLink = $('image-download-link');
+        
+        // Context Menu
+        const contextMenu = $('context-menu');
 
         // ============================================
         // UTILITIES
@@ -910,11 +959,6 @@ HTML_TEMPLATE = """
         function formatTime(timestamp) {
             const date = new Date(timestamp * 1000);
             return date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        }
-
-        function formatDate(timestamp) {
-            const date = new Date(timestamp * 1000);
-            return date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
         }
 
         function formatFileSize(bytes) {
@@ -975,6 +1019,30 @@ HTML_TEMPLATE = """
             setTimeout(() => toast.remove(), duration);
         }
 
+        function getMessageById(id) {
+            const messages = messagesContainer.querySelectorAll('.message');
+            for (const msg of messages) {
+                if (msg.dataset.messageId === id) {
+                    return msg;
+                }
+            }
+            return null;
+        }
+
+        function getMessageData(id) {
+            // Ищем в уже загруженных сообщениях
+            const msgEl = getMessageById(id);
+            if (msgEl) {
+                const nicknameEl = msgEl.querySelector('.msg-nickname');
+                const textEl = msgEl.querySelector('.msg-text');
+                return {
+                    nickname: nicknameEl ? nicknameEl.textContent : '',
+                    text: textEl ? textEl.textContent : ''
+                };
+            }
+            return null;
+        }
+
         // ============================================
         // RENDER MESSAGE
         // ============================================
@@ -982,6 +1050,8 @@ HTML_TEMPLATE = """
             const div = document.createElement('div');
             div.className = `message ${message.is_system ? 'system' : ''}`;
             div.dataset.messageId = message.id;
+            div.dataset.nickname = message.nickname;
+            div.dataset.text = message.text;
             
             // Avatar
             const avatar = document.createElement('div');
@@ -1006,6 +1076,18 @@ HTML_TEMPLATE = """
             content.className = 'content';
 
             if (!message.is_system) {
+                // Reply indicator
+                if (message.reply_to) {
+                    const replyDiv = document.createElement('div');
+                    replyDiv.className = 'reply-indicator';
+                    replyDiv.innerHTML = `
+                        <i class="fas fa-reply" style="margin-right: 0.25rem;"></i>
+                        Ответ <span class="reply-nickname">${message.reply_to.nickname}</span>:
+                        <span class="reply-text">${message.reply_to.text}</span>
+                    `;
+                    content.appendChild(replyDiv);
+                }
+
                 const header = document.createElement('div');
                 header.className = 'msg-header';
                 
@@ -1037,7 +1119,6 @@ HTML_TEMPLATE = """
             if (message.deleted) {
                 text.textContent = message.text;
             } else {
-                // Обработка упоминаний
                 const parts = message.text.split(/(@\w+)/g);
                 for (const part of parts) {
                     if (part.startsWith('@')) {
@@ -1058,12 +1139,27 @@ HTML_TEMPLATE = """
                 fileDiv.className = 'file-attachment';
                 
                 if (message.file.is_image) {
+                    const wrapper = document.createElement('div');
+                    wrapper.className = 'message-image-wrapper';
+                    
                     const img = document.createElement('img');
                     img.className = 'message-image';
                     img.src = message.file.url;
                     img.alt = message.file.filename;
                     img.onclick = () => openImageModal(message.file.url);
-                    fileDiv.appendChild(img);
+                    wrapper.appendChild(img);
+                    
+                    // Download button for image
+                    const downloadBtn = document.createElement('button');
+                    downloadBtn.className = 'download-btn';
+                    downloadBtn.innerHTML = '<i class="fas fa-download"></i> Скачать';
+                    downloadBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        downloadFile(message.file.url, message.file.filename);
+                    };
+                    wrapper.appendChild(downloadBtn);
+                    
+                    fileDiv.appendChild(wrapper);
                 } else {
                     const icon = document.createElement('i');
                     icon.className = `fas ${getFileIcon(message.file.extension)}`;
@@ -1091,34 +1187,54 @@ HTML_TEMPLATE = """
                 content.appendChild(fileDiv);
             }
 
-            // Actions (only for own messages, not system, not deleted)
-            if (!message.is_system && message.nickname === state.nickname && !message.deleted) {
+            // Actions
+            if (!message.is_system && !message.deleted) {
                 const actions = document.createElement('div');
                 actions.className = 'msg-actions';
                 
-                const editBtn = document.createElement('button');
-                editBtn.className = 'edit-btn';
-                editBtn.innerHTML = '<i class="fas fa-edit"></i>';
-                editBtn.title = 'Редактировать';
-                editBtn.onclick = (e) => {
+                // Reply button (for all messages)
+                const replyBtn = document.createElement('button');
+                replyBtn.className = 'reply-btn';
+                replyBtn.innerHTML = '<i class="fas fa-reply"></i> Ответить';
+                replyBtn.title = 'Ответить на сообщение';
+                replyBtn.onclick = (e) => {
                     e.stopPropagation();
-                    startEditing(message.id, message.text);
+                    startReply(message.id, message.nickname, message.text);
                 };
-                actions.appendChild(editBtn);
+                actions.appendChild(replyBtn);
                 
-                const deleteBtn = document.createElement('button');
-                deleteBtn.className = 'delete-btn';
-                deleteBtn.innerHTML = '<i class="fas fa-trash"></i>';
-                deleteBtn.title = 'Удалить';
-                deleteBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    if (confirm('Удалить это сообщение?')) {
-                        sendMessage({ type: 'delete', message_id: message.id });
-                    }
-                };
-                actions.appendChild(deleteBtn);
+                // Edit and Delete only for own messages
+                if (message.nickname === state.nickname) {
+                    const editBtn = document.createElement('button');
+                    editBtn.className = 'edit-btn';
+                    editBtn.innerHTML = '<i class="fas fa-edit"></i>';
+                    editBtn.title = 'Редактировать';
+                    editBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        startEditing(message.id, message.text);
+                    };
+                    actions.appendChild(editBtn);
+                    
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.className = 'delete-btn';
+                    deleteBtn.innerHTML = '<i class="fas fa-trash"></i>';
+                    deleteBtn.title = 'Удалить';
+                    deleteBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        if (confirm('Удалить это сообщение?')) {
+                            sendMessage({ type: 'delete', message_id: message.id });
+                        }
+                    };
+                    actions.appendChild(deleteBtn);
+                }
                 
                 content.appendChild(actions);
+
+                // Context menu on right-click
+                div.oncontextmenu = (e) => {
+                    e.preventDefault();
+                    showContextMenu(e.clientX, e.clientY, message.id, message.nickname);
+                };
             }
 
             div.appendChild(content);
@@ -1134,7 +1250,6 @@ HTML_TEMPLATE = """
         }
 
         function appendMessage(message) {
-            // Проверяем, не существует ли уже такое сообщение
             const existing = messagesContainer.querySelector(`[data-message-id="${message.id}"]`);
             if (existing) {
                 existing.replaceWith(renderMessage(message));
@@ -1143,12 +1258,10 @@ HTML_TEMPLATE = """
             messagesContainer.appendChild(renderMessage(message));
             scrollToBottom();
             
-            // Проверяем упоминания
             if (!message.is_system && message.text) {
                 const mentions = extractMentions(message.text);
                 if (mentions.includes(state.nickname)) {
                     showToast('🔔 Вас упомянули', `${message.nickname}: ${message.text}`);
-                    // Подсвечиваем сообщение
                     const msgEl = messagesContainer.querySelector(`[data-message-id="${message.id}"]`);
                     if (msgEl) {
                         msgEl.classList.add('mentioned');
@@ -1172,31 +1285,143 @@ HTML_TEMPLATE = """
             }
         }
 
+        function downloadFile(url, filename) {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
         // ============================================
-        // EDITING
+        // EDITING & REPLY
         // ============================================
         function startEditing(messageId, currentText) {
             state.editingMessageId = messageId;
+            state.replyingTo = null;
             messageInput.value = currentText;
             messageInput.focus();
             messageInput.classList.add('editing');
             sendBtn.textContent = '💾 Сохранить';
-            sendBtn.style.background = 'linear-gradient(135deg, #f59e0b, #fbbf24)';
+            sendBtn.classList.add('editing');
+            updateInputPlaceholder();
+        }
+
+        function startReply(messageId, nickname, text) {
+            state.replyingTo = { id: messageId, nickname: nickname, text: text.substring(0, 50) + (text.length > 50 ? '...' : '') };
+            state.editingMessageId = null;
+            messageInput.focus();
+            messageInput.classList.remove('editing');
+            sendBtn.textContent = 'Отправить';
+            sendBtn.classList.remove('editing');
+            updateInputPlaceholder();
         }
 
         function cancelEditing() {
             state.editingMessageId = null;
+            state.replyingTo = null;
             messageInput.value = '';
             messageInput.classList.remove('editing');
             sendBtn.textContent = 'Отправить';
-            sendBtn.style.background = '';
+            sendBtn.classList.remove('editing');
+            updateInputPlaceholder();
         }
+
+        function updateInputPlaceholder() {
+            if (state.editingMessageId) {
+                messageInput.placeholder = '✏️ Редактирование сообщения... (Esc для отмены)';
+            } else if (state.replyingTo) {
+                messageInput.placeholder = `💬 Ответ ${state.replyingTo.nickname}: ${state.replyingTo.text}`;
+            } else {
+                messageInput.placeholder = 'Введите сообщение... (используйте @ник для упоминания)';
+            }
+        }
+
+        // ============================================
+        // CONTEXT MENU
+        // ============================================
+        function showContextMenu(x, y, messageId, nickname) {
+            state.contextTarget = { id: messageId, nickname: nickname };
+            contextMenu.style.display = 'block';
+            contextMenu.style.left = x + 'px';
+            contextMenu.style.top = y + 'px';
+            
+            // Получаем текст сообщения для копирования
+            const msgEl = getMessageById(messageId);
+            if (msgEl) {
+                const textEl = msgEl.querySelector('.msg-text');
+                if (textEl) {
+                    state.contextTarget.text = textEl.textContent;
+                }
+            }
+        }
+
+        function hideContextMenu() {
+            contextMenu.style.display = 'none';
+            state.contextTarget = null;
+        }
+
+        // Context menu actions
+        document.querySelectorAll('.context-menu .menu-item').forEach(item => {
+            item.addEventListener('click', () => {
+                const action = item.dataset.action;
+                const target = state.contextTarget;
+                if (!target) return;
+                
+                if (action === 'reply') {
+                    const msgEl = getMessageById(target.id);
+                    if (msgEl) {
+                        const textEl = msgEl.querySelector('.msg-text');
+                        const nicknameEl = msgEl.querySelector('.msg-nickname');
+                        const text = textEl ? textEl.textContent : '';
+                        const nickname = nicknameEl ? nicknameEl.textContent : target.nickname;
+                        startReply(target.id, nickname, text);
+                    }
+                } else if (action === 'profile') {
+                    viewUserProfile(target.nickname);
+                } else if (action === 'copy') {
+                    const msgEl = getMessageById(target.id);
+                    if (msgEl) {
+                        const textEl = msgEl.querySelector('.msg-text');
+                        if (textEl) {
+                            navigator.clipboard.writeText(textEl.textContent).then(() => {
+                                showToast('✅ Скопировано', 'Текст сообщения скопирован в буфер обмена');
+                            }).catch(() => {
+                                // Fallback
+                                const range = document.createRange();
+                                range.selectNode(textEl);
+                                window.getSelection().removeAllRanges();
+                                window.getSelection().addRange(range);
+                                document.execCommand('copy');
+                                showToast('✅ Скопировано', 'Текст сообщения скопирован в буфер обмена');
+                            });
+                        }
+                    }
+                }
+                hideContextMenu();
+            });
+        });
+
+        // Hide context menu on click outside
+        document.addEventListener('click', (e) => {
+            if (!contextMenu.contains(e.target)) {
+                hideContextMenu();
+            }
+        });
+
+        // Hide context menu on scroll
+        messagesContainer.addEventListener('scroll', hideContextMenu);
 
         // ============================================
         // MODALS
         // ============================================
         function openImageModal(url) {
             modalImage.src = url;
+            imageDownloadLink.href = url;
+            // Extract filename from URL
+            const filename = url.split('/').pop();
+            imageDownloadLink.download = filename;
             imageModal.classList.add('active');
         }
 
@@ -1243,6 +1468,8 @@ HTML_TEMPLATE = """
             return `${protocol}//${window.location.host}/ws`;
         }
 
+        let authAction = 'login';
+
         function connectWebSocket() {
             if (state.ws && state.ws.readyState === WebSocket.OPEN) return;
 
@@ -1264,7 +1491,12 @@ HTML_TEMPLATE = """
                 state.reconnectAttempts = 0;
                 updateConnectionStatus(true);
                 enableChat(true);
-                sendMessage({ type: 'join', nickname: state.nickname, password: state.password || '' });
+                sendMessage({ 
+                    type: 'join', 
+                    nickname: state.nickname, 
+                    password: state.password || '',
+                    action: authAction
+                });
             };
 
             state.ws.onmessage = function(event) {
@@ -1324,11 +1556,18 @@ HTML_TEMPLATE = """
                     onlineCount.textContent = data.count;
                     break;
                 case 'mention':
-                    showToast('🔔 Вас упомянули', `${data.from}: ${data.text}`);
+                    showToast('🔔 Упоминание', `${data.from}: ${data.text}`);
                     break;
                 case 'error':
                     console.error('Server error:', data.message);
-                    showToast('❌ Ошибка', data.message);
+                    if (data.message.includes('не найден') || data.message.includes('существует')) {
+                        loginError.textContent = data.message;
+                        loginError.style.display = 'block';
+                        loginInfo.textContent = '💡 Попробуйте зарегистрироваться';
+                        loginInfo.style.display = 'block';
+                    } else {
+                        showToast('❌ Ошибка', data.message);
+                    }
                     break;
             }
         }
@@ -1357,11 +1596,23 @@ HTML_TEMPLATE = """
                     }
 
                     const fileInfo = await response.json();
+                    const replyData = state.replyingTo ? {
+                        id: state.replyingTo.id,
+                        nickname: state.replyingTo.nickname,
+                        text: state.replyingTo.text
+                    } : null;
+                    
                     sendMessage({
                         type: 'message',
                         text: isImage ? '📷 Изображение' : `📎 ${fileInfo.filename}`,
-                        file: fileInfo
+                        file: fileInfo,
+                        reply_to: replyData
                     });
+                    
+                    if (state.replyingTo) {
+                        state.replyingTo = null;
+                        updateInputPlaceholder();
+                    }
 
                 } catch (error) {
                     console.error('Upload error:', error);
@@ -1420,7 +1671,6 @@ HTML_TEMPLATE = """
                 }
             }
 
-            // Изменение пароля
             const newPassword = profilePassword.value.trim();
             if (newPassword) {
                 if (newPassword.length < 4) {
@@ -1534,8 +1784,10 @@ HTML_TEMPLATE = """
             }
 
             loginError.style.display = 'none';
+            loginInfo.style.display = 'none';
             state.nickname = nickname;
             state.password = password;
+            authAction = 'login';
 
             loginScreen.style.display = 'none';
             registerScreen.style.display = 'none';
@@ -1576,6 +1828,7 @@ HTML_TEMPLATE = """
             regError.style.display = 'none';
             state.nickname = nickname;
             state.password = password;
+            authAction = 'register';
 
             loginScreen.style.display = 'none';
             registerScreen.style.display = 'none';
@@ -1593,13 +1846,18 @@ HTML_TEMPLATE = """
             state.nickname = '';
             state.password = '';
             state.editingMessageId = null;
+            state.replyingTo = null;
+            state.contextTarget = null;
 
             chatScreen.style.display = 'none';
             loginScreen.style.display = 'flex';
             loginNickname.value = '';
             loginPassword.value = '';
+            loginError.style.display = 'none';
+            loginInfo.style.display = 'none';
             loginNickname.focus();
             cancelEditing();
+            hideContextMenu();
         }
 
         // ============================================
@@ -1628,20 +1886,37 @@ HTML_TEMPLATE = """
                     sendMessage({
                         type: 'mention',
                         target: 'all',
-                        text: text
+                        text: text,
+                        reply_to: state.replyingTo || null
                     });
                     showToast('🔔 Уведомление', 'Вы упомянули всех (@all)');
                 } else if (mention !== state.nickname) {
                     sendMessage({
                         type: 'mention',
                         target: mention,
-                        text: text
+                        text: text,
+                        reply_to: state.replyingTo || null
                     });
                 }
             }
 
-            sendMessage({ type: 'message', text: text });
+            const replyData = state.replyingTo ? {
+                id: state.replyingTo.id,
+                nickname: state.replyingTo.nickname,
+                text: state.replyingTo.text
+            } : null;
+
+            sendMessage({ 
+                type: 'message', 
+                text: text,
+                reply_to: replyData
+            });
+            
             messageInput.value = '';
+            if (state.replyingTo) {
+                state.replyingTo = null;
+                updateInputPlaceholder();
+            }
         }
 
         // ============================================
@@ -1688,6 +1963,8 @@ HTML_TEMPLATE = """
             }
             if (e.key === 'Escape') {
                 cancelEditing();
+                state.replyingTo = null;
+                updateInputPlaceholder();
                 messageInput.blur();
             }
         });
@@ -1738,8 +2015,8 @@ HTML_TEMPLATE = """
         // INIT
         // ============================================
         loginNickname.focus();
-        console.log('💬 Global Chat Pro loaded!');
-        console.log('✨ Features: Auth, Mentions, Delete, Edit, Profile View');
+        console.log('💬 Чат загружен!');
+        console.log('✨ Функции: Регистрация, Авторизация, Упоминания, Удаление, Редактирование, Ответы, Профили');
     </script>
 </body>
 </html>
