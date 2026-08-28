@@ -3,15 +3,13 @@ import hashlib
 import json
 import time
 import os
-import base64
 from collections import deque
 from datetime import datetime
 from typing import List, Dict, Set, Optional
 from pathlib import Path
-import shutil
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -20,16 +18,14 @@ from fastapi.staticfiles import StaticFiles
 # ============================================
 MAX_MESSAGES = 100
 RATE_LIMIT_SECONDS = 1
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf', '.doc', '.docx', '.txt', '.zip', '.rar'}
 
-# Директории
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 AVATAR_DIR = BASE_DIR / "avatars"
 DATA_DIR = BASE_DIR / "data"
 
-# Создаём директории
 for dir_path in [UPLOAD_DIR, AVATAR_DIR, DATA_DIR]:
     dir_path.mkdir(exist_ok=True)
 
@@ -39,8 +35,8 @@ for dir_path in [UPLOAD_DIR, AVATAR_DIR, DATA_DIR]:
 class UserProfile:
     def __init__(self, nickname: str):
         self.nickname = nickname
-        self.password_hash = None  # Будет установлен при создании
-        self.avatar = None  # Имя файла аватара
+        self.password_hash = None
+        self.avatar = None
         self.info = ""
         self.phone = ""
         self.email = ""
@@ -51,7 +47,7 @@ class UserProfile:
         return {
             "nickname": self.nickname,
             "has_password": self.password_hash is not None,
-            "avatar": self.avatar,
+            "avatar": f"/avatars/{self.avatar}" if self.avatar else None,
             "info": self.info,
             "phone": self.phone,
             "email": self.email,
@@ -64,18 +60,13 @@ class ChatState:
         self.messages: deque = deque(maxlen=MAX_MESSAGES)
         self.active_connections: Dict[WebSocket, Dict] = {}
         self.nicknames: Set[str] = set()
-        self.users: Dict[str, UserProfile] = {}  # nickname -> UserProfile
+        self.users: Dict[str, UserProfile] = {}
         self.file_counter = 0
-        
-        # Загружаем данные если есть
         self.load_data()
-        
-        # Добавляем приветственное сообщение
         if not self.messages:
             self.add_message("System", "🚀 Добро пожаловать в Global Chat!", is_system=True)
 
     def add_message(self, nickname: str, text: str, is_system: bool = False, file_info: Optional[Dict] = None):
-        """Добавляет сообщение в историю"""
         message = {
             "id": f"msg_{int(time.time() * 1000)}_{len(self.messages)}",
             "nickname": nickname,
@@ -93,9 +84,6 @@ class ChatState:
 
     def get_online_count(self) -> int:
         return len(self.active_connections)
-
-    def get_online_users(self) -> List[str]:
-        return [data["nickname"] for data in self.active_connections.values()]
 
     def is_rate_limited(self, websocket: WebSocket) -> bool:
         if websocket not in self.active_connections:
@@ -135,7 +123,6 @@ class ChatState:
         return False
 
     def save_data(self):
-        """Сохраняет данные в JSON"""
         data = {
             "messages": list(self.messages),
             "users": {
@@ -160,15 +147,10 @@ class ChatState:
             print(f"Error saving data: {e}")
 
     def load_data(self):
-        """Загружает данные из JSON"""
         try:
             with open(DATA_DIR / "chat_data.json", "r", encoding="utf-8") as f:
                 data = json.load(f)
-            
-            # Загружаем сообщения
             self.messages = deque(data.get("messages", []), maxlen=MAX_MESSAGES)
-            
-            # Загружаем пользователей
             for nick, user_data in data.get("users", {}).items():
                 profile = UserProfile(nick)
                 profile.password_hash = user_data.get("password_hash")
@@ -179,21 +161,18 @@ class ChatState:
                 profile.created_at = user_data.get("created_at", time.time())
                 profile.last_seen = user_data.get("last_seen", time.time())
                 self.users[nick] = profile
-            
             self.file_counter = data.get("file_counter", 0)
-            print(f"Loaded {len(self.messages)} messages and {len(self.users)} users")
         except FileNotFoundError:
-            print("No saved data found, starting fresh")
+            pass
         except Exception as e:
             print(f"Error loading data: {e}")
 
-# Глобальное состояние
 chat_state = ChatState()
 
 # ============================================
 # FASTAPI ПРИЛОЖЕНИЕ
 # ============================================
-app = FastAPI(title="Global Chat Pro", description="Мощный веб-мессенджер с файлами и профилями")
+app = FastAPI(title="Global Chat Pro")
 
 app.add_middleware(
     CORSMiddleware,
@@ -203,7 +182,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Монтируем статические файлы
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 app.mount("/avatars", StaticFiles(directory=str(AVATAR_DIR)), name="avatars")
 
@@ -215,27 +193,19 @@ async def get_chat_page():
     return HTML_TEMPLATE
 
 @app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    nickname: str = Form(...)
-):
-    """Загрузка файла"""
-    # Проверка размера
+async def upload_file(file: UploadFile = File(...), nickname: str = Form(...)):
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large (max 10MB)")
     
-    # Проверка расширения
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="File type not allowed")
     
-    # Генерируем уникальное имя
     chat_state.file_counter += 1
     safe_filename = f"file_{chat_state.file_counter}_{int(time.time())}_{file.filename}"
     file_path = UPLOAD_DIR / safe_filename
     
-    # Сохраняем файл
     with open(file_path, "wb") as f:
         f.write(content)
     
@@ -248,7 +218,6 @@ async def upload_file(
         "url": f"/uploads/{safe_filename}"
     }
     
-    # Проверяем, является ли файл изображением
     if ext in {'.jpg', '.jpeg', '.png', '.gif', '.webp'}:
         file_info["is_image"] = True
     
@@ -256,59 +225,41 @@ async def upload_file(
     return JSONResponse(file_info)
 
 @app.post("/api/profile/update")
-async def update_profile(
-    nickname: str = Form(...),
-    field: str = Form(...),
-    value: str = Form(...)
-):
-    """Обновление профиля"""
+async def update_profile(nickname: str = Form(...), field: str = Form(...), value: str = Form(...)):
     profile = chat_state.get_user_profile(nickname)
     if not profile:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Специальная обработка для пароля
     if field == "password":
         if value:
             profile.password_hash = hashlib.sha256(value.encode()).hexdigest()
         else:
             profile.password_hash = None
-    elif field == "avatar":
-        # Обработка аватара отдельно
-        pass
-    else:
-        if hasattr(profile, field):
-            setattr(profile, field, value)
+    elif hasattr(profile, field):
+        setattr(profile, field, value)
     
     chat_state.save_data()
     return JSONResponse({"success": True, "profile": profile.to_dict()})
 
 @app.post("/api/profile/avatar")
-async def upload_avatar(
-    file: UploadFile = File(...),
-    nickname: str = Form(...)
-):
-    """Загрузка аватара"""
+async def upload_avatar(file: UploadFile = File(...), nickname: str = Form(...)):
     profile = chat_state.get_user_profile(nickname)
     if not profile:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Проверка размера (макс 2MB для аватара)
     content = await file.read()
     if len(content) > 2 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Avatar too large (max 2MB)")
     
-    # Проверка что это изображение
     ext = Path(file.filename).suffix.lower()
     if ext not in {'.jpg', '.jpeg', '.png', '.gif', '.webp'}:
         raise HTTPException(status_code=400, detail="Avatar must be an image")
     
-    # Удаляем старый аватар
     if profile.avatar:
         old_path = AVATAR_DIR / profile.avatar
         if old_path.exists():
             old_path.unlink()
     
-    # Сохраняем новый
     avatar_name = f"avatar_{nickname}_{int(time.time())}{ext}"
     avatar_path = AVATAR_DIR / avatar_name
     with open(avatar_path, "wb") as f:
@@ -316,152 +267,971 @@ async def upload_avatar(
     
     profile.avatar = avatar_name
     chat_state.save_data()
-    
     return JSONResponse({"success": True, "avatar": f"/avatars/{avatar_name}"})
 
 @app.get("/api/profile/{nickname}")
 async def get_profile(nickname: str):
-    """Получение профиля пользователя"""
     profile = chat_state.get_user_profile(nickname)
     if not profile:
         raise HTTPException(status_code=404, detail="User not found")
     return JSONResponse(profile.to_dict())
 
-@app.get("/api/users")
-async def get_users():
-    """Список всех пользователей"""
-    users = [profile.to_dict() for profile in chat_state.users.values()]
-    return JSONResponse(users)
+# ============================================
+# WEBSOCKET ЭНДПОИНТ
+# ============================================
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    nickname = None
+    user_data = {"nickname": "Anonymous", "last_message_time": 0}
+    
+    try:
+        data = await websocket.receive_text()
+        try:
+            join_data = json.loads(data)
+            if join_data.get("type") == "join" and join_data.get("nickname"):
+                nickname = join_data["nickname"].strip()[:20]
+                
+                if nickname.lower() == "system":
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Никнейм 'System' зарезервирован"
+                    }))
+                    await websocket.close(code=1008)
+                    return
+                
+                password = join_data.get("password")
+                email = join_data.get("email")
+                
+                profile = chat_state.get_user_profile(nickname)
+                
+                if profile:
+                    if profile.password_hash:
+                        if not password or not chat_state.verify_password(nickname, password):
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "message": "Неверный пароль"
+                            }))
+                            await websocket.close(code=1008)
+                            return
+                else:
+                    chat_state.create_user(nickname, password)
+                    if email:
+                        chat_state.update_profile(nickname, email=email)
+                
+                user_data["nickname"] = nickname
+                profile.last_seen = time.time()
+                chat_state.save_data()
+            else:
+                await websocket.close(code=1008)
+                return
+        except json.JSONDecodeError:
+            await websocket.close(code=1008)
+            return
+
+        if nickname in chat_state.nicknames:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"Никнейм '{nickname}' уже в чате"
+            }))
+            await websocket.close(code=1008)
+            return
+
+        chat_state.active_connections[websocket] = user_data
+        chat_state.nicknames.add(nickname)
+        
+        await websocket.send_text(json.dumps({
+            "type": "history",
+            "messages": chat_state.get_messages()
+        }))
+
+        system_msg = chat_state.add_message(
+            "System",
+            f"👋 {nickname} присоединился к чату",
+            is_system=True
+        )
+        await broadcast_message(system_msg)
+        await broadcast_online_count()
+
+        while True:
+            try:
+                data = await websocket.receive_text()
+                try:
+                    message_data = json.loads(data)
+                    if message_data.get("type") == "message":
+                        text = message_data.get("text", "").strip()
+                        file_info = message_data.get("file")
+                        
+                        if text or file_info:
+                            if chat_state.is_rate_limited(websocket):
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": "Слишком много сообщений!"
+                                }))
+                                continue
+                            
+                            msg = chat_state.add_message(nickname, text, file_info=file_info)
+                            await broadcast_message(msg)
+                except json.JSONDecodeError:
+                    pass
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                print(f"Error in message loop: {e}")
+                break
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if websocket in chat_state.active_connections:
+            del chat_state.active_connections[websocket]
+        if nickname and nickname in chat_state.nicknames:
+            chat_state.nicknames.remove(nickname)
+        
+        if nickname:
+            system_msg = chat_state.add_message(
+                "System",
+                f"👋 {nickname} покинул чат",
+                is_system=True
+            )
+            await broadcast_message(system_msg)
+            await broadcast_online_count()
+
+async def broadcast_message(message: dict):
+    if not chat_state.active_connections:
+        return
+    
+    data = json.dumps({"type": "message", "message": message})
+    disconnected = []
+    
+    for connection in chat_state.active_connections.keys():
+        try:
+            await connection.send_text(data)
+        except Exception:
+            disconnected.append(connection)
+    
+    for conn in disconnected:
+        if conn in chat_state.active_connections:
+            del chat_state.active_connections[conn]
+
+async def broadcast_online_count():
+    count = chat_state.get_online_count()
+    data = json.dumps({"type": "online_count", "count": count})
+    disconnected = []
+    
+    for connection in chat_state.active_connections.keys():
+        try:
+            await connection.send_text(data)
+        except Exception:
+            disconnected.append(connection)
+    
+    for conn in disconnected:
+        if conn in chat_state.active_connections:
+            del chat_state.active_connections[conn]
 
 # ============================================
-# HTML ФРОНТЕНД (упрощённая версия с новыми функциями)
+# HTML ФРОНТЕНД (СТИЛЬ TELEGRAM/DISCORD)
 # ============================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Global Chat Pro</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title>Global Chat</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
-        /* ... (стили из предыдущей версии с дополнениями) ... */
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; height: 100vh; overflow: hidden; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         
-        /* Адаптация существующих стилей ... */
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; }
-        .modal.active { display: flex; }
-        .modal-content { max-width: 90%; max-height: 90%; }
-        .modal-close { position: fixed; top: 20px; right: 30px; color: white; font-size: 40px; cursor: pointer; z-index: 1001; }
-        .file-attachment { display: inline-flex; align-items: center; gap: 0.5rem; background: rgba(255,255,255,0.05); padding: 0.5rem 1rem; border-radius: 0.5rem; margin-top: 0.25rem; cursor: pointer; transition: all 0.3s; }
-        .file-attachment:hover { background: rgba(255,255,255,0.1); }
-        .file-attachment i { font-size: 1.2rem; }
-        .message .avatar { width: 40px; height: 40px; border-radius: 9999px; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.875rem; flex-shrink: 0; color: white; text-transform: uppercase; background-size: cover; background-position: center; position: relative; }
-        .avatar-image { width: 100%; height: 100%; border-radius: 9999px; object-fit: cover; }
-        .profile-modal .modal-content { background: #1e293b; color: #f1f5f9; padding: 2rem; border-radius: 1rem; max-width: 600px; width: 90%; max-height: 90vh; overflow-y: auto; }
-        .profile-modal .form-group { margin-bottom: 1rem; }
-        .profile-modal label { display: block; color: #94a3b8; font-size: 0.875rem; margin-bottom: 0.25rem; }
-        .profile-modal input, .profile-modal textarea { width: 100%; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: #f1f5f9; padding: 0.5rem 0.75rem; border-radius: 0.5rem; }
-        .profile-modal input:focus, .profile-modal textarea:focus { outline: none; border-color: #60a5fa; }
-        .profile-modal .avatar-upload { display: flex; align-items: center; gap: 1rem; }
-        .profile-modal .current-avatar { width: 80px; height: 80px; border-radius: 9999px; object-fit: cover; background: #334155; }
-        .profile-modal .btn { padding: 0.5rem 1.5rem; border-radius: 0.5rem; border: none; cursor: pointer; font-weight: 500; transition: all 0.3s; }
-        .btn-primary { background: linear-gradient(135deg, #60a5fa, #a78bfa); color: white; }
-        .btn-secondary { background: #334155; color: #f1f5f9; }
-        .btn-danger { background: #ef4444; color: white; }
-        .btn-sm { padding: 0.25rem 0.75rem; font-size: 0.875rem; }
-        .file-input-wrapper { position: relative; overflow: hidden; display: inline-block; }
-        .file-input-wrapper input[type=file] { position: absolute; left: 0; top: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; }
-        .message-image { max-width: 300px; max-height: 300px; border-radius: 0.5rem; cursor: pointer; margin-top: 0.25rem; transition: transform 0.2s; }
-        .message-image:hover { transform: scale(1.02); }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #0e0e10;
+            height: 100vh;
+            overflow: hidden;
+            color: #e4e4e7;
+        }
+        
+        /* ===== LOGIN SCREEN ===== */
+        #login-screen {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #0e0e10 0%, #1a1a2e 100%);
+        }
+        
+        .login-card {
+            background: rgba(30, 30, 46, 0.9);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            padding: 2.5rem;
+            border-radius: 1.5rem;
+            width: 100%;
+            max-width: 400px;
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8);
+        }
+        
+        .login-card h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #5865f2, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+            margin-bottom: 0.5rem;
+        }
+        
+        .login-card .subtitle {
+            color: #8e8ea0;
+            text-align: center;
+            margin-bottom: 2rem;
+            font-size: 0.95rem;
+        }
+        
+        .login-card input {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 0.75rem;
+            color: #e4e4e7;
+            font-size: 1rem;
+            transition: all 0.3s;
+        }
+        
+        .login-card input:focus {
+            outline: none;
+            border-color: #5865f2;
+            box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.15);
+        }
+        
+        .login-card input::placeholder {
+            color: #6e6e80;
+        }
+        
+        .login-card .btn-join {
+            width: 100%;
+            padding: 0.75rem;
+            background: linear-gradient(135deg, #5865f2, #7c6df0);
+            color: white;
+            border: none;
+            border-radius: 0.75rem;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 1rem;
+        }
+        
+        .login-card .btn-join:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(88, 101, 242, 0.3);
+        }
+        
+        .login-card .btn-link {
+            background: none;
+            border: none;
+            color: #8e8ea0;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: color 0.3s;
+            margin-top: 0.75rem;
+        }
+        
+        .login-card .btn-link:hover {
+            color: #e4e4e7;
+        }
+        
+        /* ===== CHAT SCREEN ===== */
+        #chat-screen {
+            display: none;
+            flex-direction: column;
+            height: 100vh;
+            background: #0e0e10;
+        }
+        
+        /* Header */
+        .chat-header {
+            background: rgba(30, 30, 46, 0.95);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 0.75rem 1.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+            z-index: 10;
+        }
+        
+        .chat-header .left {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        
+        .chat-header .title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #e4e4e7;
+        }
+        
+        .chat-header .online-badge {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            background: rgba(88, 101, 242, 0.15);
+            color: #a78bfa;
+            font-size: 0.75rem;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-weight: 500;
+        }
+        
+        .chat-header .online-badge .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: pulse-dot 2s infinite;
+        }
+        
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        
+        .chat-header .right {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        
+        .chat-header .right .user-name {
+            color: #8e8ea0;
+            font-size: 0.85rem;
+        }
+        
+        .chat-header .right .user-name span {
+            color: #e4e4e7;
+            font-weight: 500;
+        }
+        
+        .chat-header .right .icon-btn {
+            background: none;
+            border: none;
+            color: #8e8ea0;
+            font-size: 1.1rem;
+            cursor: pointer;
+            padding: 0.4rem;
+            border-radius: 0.5rem;
+            transition: all 0.3s;
+        }
+        
+        .chat-header .right .icon-btn:hover {
+            color: #e4e4e7;
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .chat-header .right .leave-btn {
+            background: rgba(239, 68, 68, 0.15);
+            color: #f87171;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            border: none;
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .chat-header .right .leave-btn:hover {
+            background: rgba(239, 68, 68, 0.25);
+        }
+        
+        /* Connection Status */
+        .connection-status {
+            padding: 0.4rem 1.5rem;
+            text-align: center;
+            font-size: 0.8rem;
+            font-weight: 500;
+            display: none;
+            flex-shrink: 0;
+        }
+        
+        .connection-status.connected {
+            background: rgba(74, 222, 128, 0.08);
+            color: #4ade80;
+            border-bottom: 1px solid rgba(74, 222, 128, 0.1);
+            display: block;
+        }
+        
+        .connection-status.disconnected {
+            background: rgba(239, 68, 68, 0.08);
+            color: #f87171;
+            border-bottom: 1px solid rgba(239, 68, 68, 0.1);
+            display: block;
+        }
+        
+        /* Messages Container */
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+            scroll-behavior: smooth;
+        }
+        
+        .messages-container::-webkit-scrollbar {
+            width: 5px;
+        }
+        
+        .messages-container::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        
+        .messages-container::-webkit-scrollbar-thumb {
+            background: #2a2a3a;
+            border-radius: 9999px;
+        }
+        
+        .messages-container::-webkit-scrollbar-thumb:hover {
+            background: #3a3a4a;
+        }
+        
+        /* Message */
+        .message {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.6rem;
+            padding: 0.2rem 0;
+            animation: fadeIn 0.15s ease-in;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .message .avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.75rem;
+            color: white;
+            text-transform: uppercase;
+            overflow: hidden;
+            background: #2a2a3a;
+        }
+        
+        .message .avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .message .content {
+            flex: 1;
+            min-width: 0;
+            padding-top: 0.15rem;
+        }
+        
+        .message .content .msg-header {
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        
+        .message .content .msg-nickname {
+            font-weight: 600;
+            font-size: 0.85rem;
+            color: #e4e4e7;
+        }
+        
+        .message .content .msg-time {
+            color: #5e5e70;
+            font-size: 0.65rem;
+        }
+        
+        .message .content .msg-text {
+            color: #d4d4d8;
+            font-size: 0.92rem;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            line-height: 1.4;
+        }
+        
+        .message.system {
+            justify-content: center;
+        }
+        
+        .message.system .content .msg-text {
+            color: #6e6e80;
+            font-size: 0.8rem;
+            font-style: italic;
+            text-align: center;
+        }
+        
+        .message.system .avatar {
+            display: none;
+        }
+        
+        /* File Attachment */
+        .file-attachment {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(255, 255, 255, 0.04);
+            padding: 0.4rem 0.75rem;
+            border-radius: 0.5rem;
+            margin-top: 0.2rem;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        
+        .file-attachment:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        
+        .file-attachment i {
+            font-size: 1rem;
+            color: #8e8ea0;
+        }
+        
+        .file-attachment .file-name {
+            color: #d4d4d8;
+            font-size: 0.8rem;
+        }
+        
+        .file-attachment .file-size {
+            color: #6e6e80;
+            font-size: 0.7rem;
+        }
+        
+        .file-attachment .download-link {
+            color: #5865f2;
+            text-decoration: none;
+            font-size: 0.8rem;
+        }
+        
+        .file-attachment .download-link:hover {
+            color: #7c6df0;
+        }
+        
+        .message-image {
+            max-width: 280px;
+            max-height: 280px;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            margin-top: 0.2rem;
+            transition: transform 0.2s;
+            border: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        
+        .message-image:hover {
+            transform: scale(1.02);
+        }
+        
+        /* Input Area */
+        .input-area {
+            background: rgba(30, 30, 46, 0.95);
+            backdrop-filter: blur(10px);
+            border-top: 1px solid rgba(255, 255, 255, 0.04);
+            padding: 0.6rem 1rem;
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        
+        .input-area .input-wrapper {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 0.75rem;
+            padding: 0 0.5rem;
+            transition: all 0.3s;
+        }
+        
+        .input-area .input-wrapper:focus-within {
+            border-color: #5865f2;
+            box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.1);
+        }
+        
+        .input-area .input-wrapper .icon-btn {
+            background: none;
+            border: none;
+            color: #6e6e80;
+            font-size: 1rem;
+            cursor: pointer;
+            padding: 0.4rem;
+            border-radius: 0.4rem;
+            transition: all 0.3s;
+        }
+        
+        .input-area .input-wrapper .icon-btn:hover {
+            color: #e4e4e7;
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .input-area .input-wrapper input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: #e4e4e7;
+            padding: 0.6rem 0.3rem;
+            font-size: 0.92rem;
+            min-width: 0;
+        }
+        
+        .input-area .input-wrapper input:focus {
+            outline: none;
+        }
+        
+        .input-area .input-wrapper input::placeholder {
+            color: #6e6e80;
+        }
+        
+        .input-area .input-wrapper input:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .input-area .btn-send {
+            background: linear-gradient(135deg, #5865f2, #7c6df0);
+            color: white;
+            padding: 0.6rem 1.2rem;
+            border: none;
+            border-radius: 0.75rem;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.3s;
+            white-space: nowrap;
+        }
+        
+        .input-area .btn-send:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(88, 101, 242, 0.3);
+        }
+        
+        .input-area .btn-send:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        /* Modals */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .modal.active {
+            display: flex;
+        }
+        
+        .modal-content {
+            max-width: 90%;
+            max-height: 90%;
+            border-radius: 0.5rem;
+        }
+        
+        .modal-close {
+            position: fixed;
+            top: 20px;
+            right: 30px;
+            color: #8e8ea0;
+            font-size: 2rem;
+            cursor: pointer;
+            z-index: 1001;
+            transition: color 0.3s;
+        }
+        
+        .modal-close:hover {
+            color: #e4e4e7;
+        }
+        
+        /* Profile Modal */
+        .profile-modal .modal-content {
+            background: #1e1e2e;
+            color: #e4e4e7;
+            padding: 2rem;
+            border-radius: 1rem;
+            max-width: 500px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        
+        .profile-modal .modal-content h2 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+        }
+        
+        .profile-modal .form-group {
+            margin-bottom: 1rem;
+        }
+        
+        .profile-modal .form-group label {
+            display: block;
+            color: #8e8ea0;
+            font-size: 0.8rem;
+            margin-bottom: 0.25rem;
+        }
+        
+        .profile-modal .form-group input,
+        .profile-modal .form-group textarea {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            color: #e4e4e7;
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            font-size: 0.9rem;
+            transition: all 0.3s;
+        }
+        
+        .profile-modal .form-group input:focus,
+        .profile-modal .form-group textarea:focus {
+            outline: none;
+            border-color: #5865f2;
+        }
+        
+        .profile-modal .avatar-upload {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .profile-modal .current-avatar {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            object-fit: cover;
+            background: #2a2a3a;
+        }
+        
+        .profile-modal .btn {
+            padding: 0.4rem 1.2rem;
+            border-radius: 0.5rem;
+            border: none;
+            font-weight: 500;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .profile-modal .btn-primary {
+            background: linear-gradient(135deg, #5865f2, #7c6df0);
+            color: white;
+        }
+        
+        .profile-modal .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(88, 101, 242, 0.3);
+        }
+        
+        .profile-modal .btn-secondary {
+            background: rgba(255, 255, 255, 0.06);
+            color: #e4e4e7;
+        }
+        
+        .profile-modal .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .profile-modal .btn-sm {
+            padding: 0.25rem 0.75rem;
+            font-size: 0.75rem;
+        }
+        
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+        }
+        
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: 0;
+            top: 0;
+            opacity: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+        
+        .profile-modal .btn-group {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1.5rem;
+        }
+        
+        #profile-message {
+            margin-top: 0.75rem;
+            font-size: 0.85rem;
+        }
+        
+        /* Responsive */
+        @media (max-width: 640px) {
+            .chat-header {
+                padding: 0.5rem 0.75rem;
+            }
+            .chat-header .title {
+                font-size: 0.95rem;
+            }
+            .chat-header .right .user-name {
+                font-size: 0.75rem;
+            }
+            .messages-container {
+                padding: 0.5rem 0.75rem;
+            }
+            .input-area {
+                padding: 0.4rem 0.5rem;
+                gap: 0.3rem;
+            }
+            .input-area .input-wrapper input {
+                font-size: 0.85rem;
+                padding: 0.4rem 0.2rem;
+            }
+            .input-area .btn-send {
+                padding: 0.4rem 0.8rem;
+                font-size: 0.8rem;
+            }
+            .message .avatar {
+                width: 28px;
+                height: 28px;
+                font-size: 0.65rem;
+            }
+            .message .content .msg-text {
+                font-size: 0.85rem;
+            }
+            .message-image {
+                max-width: 200px;
+                max-height: 200px;
+            }
+            .login-card {
+                padding: 1.5rem;
+                margin: 0 1rem;
+            }
+            .profile-modal .modal-content {
+                padding: 1.5rem;
+            }
+        }
     </style>
 </head>
 <body>
     <!-- Login Screen -->
     <div id="login-screen">
-        <div class="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 to-slate-800">
-            <div class="bg-white/5 backdrop-blur-lg border border-white/10 p-10 rounded-2xl w-full max-w-md shadow-2xl">
-                <h1 class="text-4xl font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent text-center mb-2">💬 Global Chat</h1>
-                <p class="text-slate-400 text-center mb-8">Присоединяйтесь к общему чату</p>
-                <input type="text" id="nickname-input" placeholder="Введите никнейм..." maxlength="20" class="w-full bg-white/10 border border-white/20 text-slate-100 px-4 py-3 rounded-xl focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-400/20">
-                <div id="login-error" class="text-red-400 text-sm mt-2 hidden"></div>
-                <button id="join-btn" class="w-full mt-4 bg-gradient-to-r from-blue-400 to-purple-400 text-white font-semibold py-3 rounded-xl hover:shadow-lg hover:shadow-blue-400/30 transition-all">Войти в чат</button>
-                <div class="mt-4 text-center">
-                    <button id="show-register-btn" class="text-slate-400 text-sm hover:text-slate-200 transition-colors">🔑 Зарегистрироваться</button>
-                </div>
-            </div>
+        <div class="login-card">
+            <h1>💬 Global Chat</h1>
+            <p class="subtitle">Присоединяйтесь к общему чату</p>
+            <input type="text" id="nickname-input" placeholder="Введите никнейм..." maxlength="20" autofocus>
+            <div id="login-error" style="color: #f87171; font-size: 0.85rem; margin-top: 0.5rem; display: none;"></div>
+            <button class="btn-join" id="join-btn">Войти в чат</button>
+            <button class="btn-link" id="show-register-btn">🔑 Зарегистрироваться</button>
         </div>
     </div>
 
-    <!-- Регистрация -->
+    <!-- Register Screen -->
     <div id="register-screen" style="display:none;">
-        <div class="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-slate-900 to-slate-800">
-            <div class="bg-white/5 backdrop-blur-lg border border-white/10 p-10 rounded-2xl w-full max-w-md shadow-2xl">
-                <h2 class="text-3xl font-bold text-white text-center mb-2">📝 Регистрация</h2>
-                <p class="text-slate-400 text-center mb-6">Создайте аккаунт для дополнительных функций</p>
-                <input type="text" id="reg-nickname" placeholder="Никнейм" maxlength="20" class="w-full bg-white/10 border border-white/20 text-slate-100 px-4 py-3 rounded-xl focus:outline-none focus:border-blue-400 mb-3">
-                <input type="password" id="reg-password" placeholder="Пароль (опционально)" class="w-full bg-white/10 border border-white/20 text-slate-100 px-4 py-3 rounded-xl focus:outline-none focus:border-blue-400 mb-3">
-                <input type="email" id="reg-email" placeholder="Email (опционально)" class="w-full bg-white/10 border border-white/20 text-slate-100 px-4 py-3 rounded-xl focus:outline-none focus:border-blue-400 mb-3">
-                <div id="reg-error" class="text-red-400 text-sm mt-2 hidden"></div>
-                <button id="register-btn" class="w-full bg-gradient-to-r from-blue-400 to-purple-400 text-white font-semibold py-3 rounded-xl hover:shadow-lg hover:shadow-blue-400/30 transition-all">Создать аккаунт</button>
-                <button id="back-to-login-btn" class="w-full mt-3 text-slate-400 text-sm hover:text-slate-200 transition-colors">← Назад</button>
-            </div>
+        <div class="login-card">
+            <h2 style="font-size: 1.8rem; font-weight: 700; text-align: center; color: #e4e4e7; margin-bottom: 0.25rem;">📝 Регистрация</h2>
+            <p class="subtitle">Создайте аккаунт</p>
+            <input type="text" id="reg-nickname" placeholder="Никнейм" maxlength="20" style="margin-bottom: 0.5rem;">
+            <input type="password" id="reg-password" placeholder="Пароль (опционально)" style="margin-bottom: 0.5rem;">
+            <input type="email" id="reg-email" placeholder="Email (опционально)" style="margin-bottom: 0.5rem;">
+            <div id="reg-error" style="color: #f87171; font-size: 0.85rem; margin-top: 0.5rem; display: none;"></div>
+            <button class="btn-join" id="register-btn">Создать аккаунт</button>
+            <button class="btn-link" id="back-to-login-btn" style="display: block; margin-top: 0.75rem;">← Назад</button>
         </div>
     </div>
 
     <!-- Chat Screen -->
-    <div id="chat-screen" style="display:none;">
-        <div class="chat-header bg-slate-800/95 backdrop-blur-lg border-b border-white/5 px-6 py-4 flex justify-between items-center flex-wrap gap-2">
-            <div class="flex items-center gap-3">
-                <span class="text-slate-100 text-xl font-semibold">💬 Global Chat</span>
-                <span class="online-badge bg-green-500/20 text-green-400 text-xs px-3 py-1 rounded-full" id="online-count">🟢 0</span>
+    <div id="chat-screen">
+        <!-- Header -->
+        <div class="chat-header">
+            <div class="left">
+                <span class="title">💬 Global Chat</span>
+                <span class="online-badge">
+                    <span class="dot"></span>
+                    <span id="online-count">0</span>
+                </span>
             </div>
-            <div class="flex items-center gap-3">
-                <span class="text-slate-400 text-sm">Вы: <span class="text-slate-100 font-medium" id="current-nickname">—</span></span>
-                <button id="profile-btn" class="text-slate-400 hover:text-slate-200 transition-colors" title="Профиль"><i class="fas fa-user-circle text-xl"></i></button>
-                <button id="leave-btn" class="text-red-400 hover:text-red-300 text-sm px-3 py-1 rounded-full border border-red-400/30 hover:border-red-400/60 transition-all">Выйти</button>
+            <div class="right">
+                <span class="user-name">Вы: <span id="current-nickname">—</span></span>
+                <button class="icon-btn" id="profile-btn" title="Профиль"><i class="fas fa-user-circle"></i></button>
+                <button class="leave-btn" id="leave-btn">Выйти</button>
             </div>
         </div>
 
+        <!-- Connection Status -->
         <div class="connection-status" id="connection-status">⚠️ Нет соединения с сервером...</div>
 
-        <div class="messages-container flex-1 overflow-y-auto px-6 py-4 space-y-2" id="messages-container"></div>
+        <!-- Messages -->
+        <div class="messages-container" id="messages-container"></div>
 
-        <div class="input-area bg-slate-800/95 backdrop-blur-lg border-t border-white/5 px-6 py-3 flex gap-3">
-            <div class="flex gap-2">
-                <button id="attach-btn" class="text-slate-400 hover:text-slate-200 transition-colors" title="Прикрепить файл"><i class="fas fa-paperclip text-xl"></i></button>
-                <button id="image-btn" class="text-slate-400 hover:text-slate-200 transition-colors" title="Прикрепить изображение"><i class="fas fa-image text-xl"></i></button>
+        <!-- Input -->
+        <div class="input-area">
+            <div class="input-wrapper">
+                <button class="icon-btn" id="attach-btn" title="Прикрепить файл"><i class="fas fa-paperclip"></i></button>
+                <button class="icon-btn" id="image-btn" title="Прикрепить изображение"><i class="fas fa-image"></i></button>
+                <input type="text" id="message-input" placeholder="Введите сообщение..." disabled>
             </div>
-            <input type="text" id="message-input" placeholder="Введите сообщение..." disabled class="flex-1 bg-white/5 border border-white/10 text-slate-100 px-4 py-2 rounded-xl focus:outline-none focus:border-blue-400">
-            <button id="send-btn" disabled class="bg-gradient-to-r from-blue-400 to-purple-400 text-white px-6 py-2 rounded-xl font-semibold hover:shadow-lg hover:shadow-blue-400/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed">Отправить</button>
+            <button class="btn-send" id="send-btn" disabled>Отправить</button>
         </div>
     </div>
 
-    <!-- Модальное окно для просмотра изображений -->
+    <!-- Image Modal -->
     <div class="modal" id="image-modal">
         <span class="modal-close" id="modal-close">&times;</span>
         <img class="modal-content" id="modal-image">
     </div>
 
-    <!-- Модальное окно профиля -->
+    <!-- Profile Modal -->
     <div class="modal profile-modal" id="profile-modal">
         <div class="modal-content">
-            <h2 class="text-2xl font-bold text-white mb-4">👤 Профиль</h2>
-            <div class="form-group avatar-upload">
+            <h2>👤 Профиль</h2>
+            <div class="avatar-upload">
                 <img id="profile-avatar" class="current-avatar" src="" alt="Avatar">
-                <div class="flex flex-col gap-2">
+                <div>
                     <div class="file-input-wrapper">
                         <button class="btn btn-primary btn-sm">📷 Сменить аватар</button>
                         <input type="file" id="avatar-input" accept="image/*">
                     </div>
-                    <span class="text-xs text-slate-500">Максимум 2MB</span>
+                    <span style="color: #6e6e80; font-size: 0.7rem;">Максимум 2MB</span>
                 </div>
             </div>
             <div class="form-group">
                 <label>Информация о себе</label>
-                <textarea id="profile-info" rows="3" placeholder="Расскажите о себе..."></textarea>
+                <textarea id="profile-info" rows="2" placeholder="Расскажите о себе..."></textarea>
             </div>
             <div class="form-group">
                 <label>Телефон</label>
@@ -473,24 +1243,24 @@ HTML_TEMPLATE = """
             </div>
             <div class="form-group">
                 <label>Пароль</label>
-                <input type="password" id="profile-password" placeholder="Введите новый пароль (оставьте пустым для удаления)">
-                <span class="text-xs text-slate-500">Оставьте пустым, чтобы удалить пароль</span>
+                <input type="password" id="profile-password" placeholder="Новый пароль (оставьте пустым для удаления)">
+                <span style="color: #6e6e80; font-size: 0.7rem;">Оставьте пустым, чтобы удалить пароль</span>
             </div>
-            <div class="flex gap-3 mt-4">
-                <button id="profile-save-btn" class="btn btn-primary">💾 Сохранить</button>
-                <button id="profile-close-btn" class="btn btn-secondary">Закрыть</button>
+            <div class="btn-group">
+                <button class="btn btn-primary" id="profile-save-btn">💾 Сохранить</button>
+                <button class="btn btn-secondary" id="profile-close-btn">Закрыть</button>
             </div>
-            <div id="profile-message" class="mt-2 text-sm hidden"></div>
+            <div id="profile-message"></div>
         </div>
     </div>
 
-    <!-- Скрытые input для загрузки файлов -->
+    <!-- Hidden file inputs -->
     <input type="file" id="file-input" style="display:none" multiple>
     <input type="file" id="image-input" style="display:none" accept="image/*" multiple>
 
     <script>
         // ============================================
-        // СОСТОЯНИЕ КЛИЕНТА
+        // STATE
         // ============================================
         const state = {
             ws: null,
@@ -503,9 +1273,9 @@ HTML_TEMPLATE = """
         };
 
         // ============================================
-        // DOM ЭЛЕМЕНТЫ
+        // DOM REFS
         // ============================================
-        const $ = (id) => document.getElementById(id);
+        const $ = id => document.getElementById(id);
         const loginScreen = $('login-screen');
         const registerScreen = $('register-screen');
         const chatScreen = $('chat-screen');
@@ -546,7 +1316,7 @@ HTML_TEMPLATE = """
         const regError = $('reg-error');
 
         // ============================================
-        // УТИЛИТЫ
+        // UTILITIES
         // ============================================
         function getColorFromString(str) {
             let hash = 0;
@@ -571,7 +1341,7 @@ HTML_TEMPLATE = """
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
         }
 
-        function getFileIcon(extension) {
+        function getFileIcon(ext) {
             const icons = {
                 '.pdf': 'fa-file-pdf',
                 '.doc': 'fa-file-word',
@@ -579,16 +1349,11 @@ HTML_TEMPLATE = """
                 '.txt': 'fa-file-alt',
                 '.zip': 'fa-file-archive',
                 '.rar': 'fa-file-archive',
-                '.jpg': 'fa-file-image',
-                '.jpeg': 'fa-file-image',
-                '.png': 'fa-file-image',
-                '.gif': 'fa-file-image',
-                '.webp': 'fa-file-image',
             };
-            return icons[extension] || 'fa-file';
+            return icons[ext] || 'fa-file';
         }
 
-        function getFileColor(extension) {
+        function getFileColor(ext) {
             const colors = {
                 '.pdf': '#ef4444',
                 '.doc': '#3b82f6',
@@ -596,80 +1361,66 @@ HTML_TEMPLATE = """
                 '.txt': '#8b5cf6',
                 '.zip': '#f59e0b',
                 '.rar': '#f59e0b',
-                '.jpg': '#10b981',
-                '.jpeg': '#10b981',
-                '.png': '#10b981',
-                '.gif': '#10b981',
-                '.webp': '#10b981',
             };
-            return colors[extension] || '#64748b';
+            return colors[ext] || '#6e6e80';
         }
 
         // ============================================
-        // ОТРИСОВКА СООБЩЕНИЙ
+        // RENDER MESSAGE
         // ============================================
         function renderMessage(message) {
             const div = document.createElement('div');
-            div.className = `message flex gap-3 animate-fadeIn ${message.is_system ? 'system' : ''}`;
+            div.className = `message ${message.is_system ? 'system' : ''}`;
             
-            // Аватар
+            // Avatar
             const avatar = document.createElement('div');
-            avatar.className = 'avatar flex-shrink-0';
+            avatar.className = 'avatar';
             
-            if (message.is_system) {
-                avatar.textContent = '🔔';
-                avatar.style.background = '#334155';
-            } else {
-                // Проверяем есть ли аватар у пользователя
-                const profile = state.profile && state.profile.nickname === message.nickname ? state.profile : null;
-                if (profile && profile.avatar) {
+            if (!message.is_system) {
+                if (state.profile && state.profile.nickname === message.nickname && state.profile.avatar) {
                     const img = document.createElement('img');
-                    img.className = 'avatar-image';
-                    img.src = profile.avatar;
+                    img.src = state.profile.avatar;
                     avatar.appendChild(img);
                 } else {
-                    const initial = message.nickname.charAt(0).toUpperCase();
-                    avatar.textContent = initial;
+                    avatar.textContent = message.nickname.charAt(0).toUpperCase();
                     avatar.style.background = getColorFromString(message.nickname);
                 }
             }
             div.appendChild(avatar);
 
-            // Контент
+            // Content
             const content = document.createElement('div');
-            content.className = 'content flex-1 min-w-0';
+            content.className = 'content';
 
-            // Имя и время
-            const header = document.createElement('div');
-            header.className = 'flex items-center gap-2 flex-wrap';
-            
             if (!message.is_system) {
-                const nameSpan = document.createElement('span');
-                nameSpan.className = 'font-semibold text-sm';
-                nameSpan.textContent = message.nickname;
-                nameSpan.style.color = getColorFromString(message.nickname);
-                header.appendChild(nameSpan);
+                const header = document.createElement('div');
+                header.className = 'msg-header';
+                
+                const name = document.createElement('span');
+                name.className = 'msg-nickname';
+                name.textContent = message.nickname;
+                name.style.color = getColorFromString(message.nickname);
+                header.appendChild(name);
+                
+                const time = document.createElement('span');
+                time.className = 'msg-time';
+                time.textContent = formatTime(message.timestamp);
+                header.appendChild(time);
+                
+                content.appendChild(header);
             }
 
-            const timeSpan = document.createElement('span');
-            timeSpan.className = 'text-slate-500 text-xs';
-            timeSpan.textContent = formatTime(message.timestamp);
-            header.appendChild(timeSpan);
-            content.appendChild(header);
+            const text = document.createElement('div');
+            text.className = 'msg-text';
+            text.textContent = message.text;
+            content.appendChild(text);
 
-            // Текст
-            const textSpan = document.createElement('div');
-            textSpan.className = `text-slate-100 ${message.is_system ? 'text-slate-400 italic' : ''}`;
-            textSpan.textContent = message.text;
-            content.appendChild(textSpan);
-
-            // Файл
+            // File
             if (message.file) {
                 const fileDiv = document.createElement('div');
                 fileDiv.className = 'file-attachment';
                 
                 if (message.file.is_image) {
-                    // Отображение изображения
                     const img = document.createElement('img');
                     img.className = 'message-image';
                     img.src = message.file.url;
@@ -677,27 +1428,27 @@ HTML_TEMPLATE = """
                     img.onclick = () => openImageModal(message.file.url);
                     fileDiv.appendChild(img);
                 } else {
-                    // Отображение файла
                     const icon = document.createElement('i');
                     icon.className = `fas ${getFileIcon(message.file.extension)}`;
                     icon.style.color = getFileColor(message.file.extension);
                     fileDiv.appendChild(icon);
                     
                     const info = document.createElement('span');
-                    info.className = 'text-sm text-slate-300';
-                    info.textContent = `${message.file.filename} (${formatFileSize(message.file.size)})`;
+                    info.className = 'file-name';
+                    info.textContent = message.file.filename;
                     fileDiv.appendChild(info);
                     
-                    const downloadBtn = document.createElement('a');
-                    downloadBtn.href = message.file.url;
-                    downloadBtn.download = message.file.filename;
-                    downloadBtn.className = 'text-blue-400 hover:text-blue-300 text-sm ml-2';
-                    downloadBtn.innerHTML = '<i class="fas fa-download"></i>';
-                    fileDiv.appendChild(downloadBtn);
+                    const size = document.createElement('span');
+                    size.className = 'file-size';
+                    size.textContent = formatFileSize(message.file.size);
+                    fileDiv.appendChild(size);
                     
-                    fileDiv.onclick = () => {
-                        window.open(message.file.url, '_blank');
-                    };
+                    const link = document.createElement('a');
+                    link.className = 'download-link';
+                    link.href = message.file.url;
+                    link.download = message.file.filename;
+                    link.innerHTML = '<i class="fas fa-download"></i>';
+                    fileDiv.appendChild(link);
                 }
                 
                 content.appendChild(fileDiv);
@@ -721,7 +1472,7 @@ HTML_TEMPLATE = """
         }
 
         // ============================================
-        // МОДАЛЬНОЕ ОКНО ДЛЯ ИЗОБРАЖЕНИЙ
+        // MODALS
         // ============================================
         function openImageModal(url) {
             modalImage.src = url;
@@ -750,13 +1501,13 @@ HTML_TEMPLATE = """
             try {
                 state.ws = new WebSocket(getWebSocketUrl());
             } catch (e) {
-                console.error('WebSocket connection error:', e);
+                console.error('WebSocket error:', e);
                 scheduleReconnect();
                 return;
             }
 
             state.ws.onopen = function() {
-                console.log('WebSocket connected');
+                console.log('Connected');
                 state.connected = true;
                 state.reconnecting = false;
                 state.reconnectAttempts = 0;
@@ -770,12 +1521,12 @@ HTML_TEMPLATE = """
                     const data = JSON.parse(event.data);
                     handleWebSocketMessage(data);
                 } catch (e) {
-                    console.error('Failed to parse message:', e);
+                    console.error('Parse error:', e);
                 }
             };
 
             state.ws.onclose = function() {
-                console.log('WebSocket closed');
+                console.log('Disconnected');
                 state.connected = false;
                 updateConnectionStatus(false);
                 enableChat(false);
@@ -813,19 +1564,16 @@ HTML_TEMPLATE = """
                     appendMessage(data.message);
                     break;
                 case 'online_count':
-                    updateOnlineCount(data.count);
+                    onlineCount.textContent = data.count;
                     break;
                 case 'error':
                     console.error('Server error:', data.message);
-                    showNotification(data.message, 'error');
                     break;
-                default:
-                    console.log('Unknown message type:', data.type);
             }
         }
 
         // ============================================
-        // ЗАГРУЗКА ФАЙЛОВ
+        // FILE UPLOAD
         // ============================================
         async function uploadFiles(files, isImage = false) {
             if (!files || files.length === 0) return;
@@ -843,12 +1591,11 @@ HTML_TEMPLATE = """
 
                     if (!response.ok) {
                         const error = await response.json();
-                        showNotification(`Ошибка загрузки: ${error.detail}`, 'error');
+                        console.error('Upload error:', error);
                         continue;
                     }
 
                     const fileInfo = await response.json();
-                    // Отправляем сообщение с файлом
                     sendMessage({
                         type: 'message',
                         text: isImage ? '📷 Изображение' : `📎 ${fileInfo.filename}`,
@@ -857,13 +1604,12 @@ HTML_TEMPLATE = """
 
                 } catch (error) {
                     console.error('Upload error:', error);
-                    showNotification('Ошибка загрузки файла', 'error');
                 }
             }
         }
 
         // ============================================
-        // ПРОФИЛЬ
+        // PROFILE
         // ============================================
         async function loadProfile(nickname) {
             try {
@@ -879,7 +1625,7 @@ HTML_TEMPLATE = """
 
         function updateProfileUI() {
             if (!state.profile) return;
-            profileAvatar.src = state.profile.avatar || 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="80" height="80"%3E%3Ccircle cx="40" cy="40" r="40" fill="%23334155"/%3E%3Ctext x="40" y="45" text-anchor="middle" fill="%23f1f5f9" font-size="30" font-weight="bold"%3E' + state.nickname.charAt(0).toUpperCase() + '%3C/text%3E%3C/svg%3E';
+            profileAvatar.src = state.profile.avatar || `data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="64" height="64"%3E%3Ccircle cx="32" cy="32" r="32" fill="%232a2a3a"/%3E%3Ctext x="32" y="38" text-anchor="middle" fill="%23e4e4e7" font-size="28" font-weight="bold"%3E${state.nickname.charAt(0).toUpperCase()}%3C/text%3E%3C/svg%3E`;
             profileInfo.value = state.profile.info || '';
             profilePhone.value = state.profile.phone || '';
             profileEmail.value = state.profile.email || '';
@@ -909,19 +1655,21 @@ HTML_TEMPLATE = """
                     });
                     if (!response.ok) {
                         success = false;
-                        const error = await response.json();
-                        showProfileMessage(error.detail || 'Ошибка сохранения', 'error');
                     }
                 } catch (error) {
                     success = false;
-                    showProfileMessage('Ошибка сохранения', 'error');
                 }
             }
 
             if (success) {
-                showProfileMessage('✅ Профиль сохранён!', 'success');
+                profileMessage.textContent = '✅ Профиль сохранён!';
+                profileMessage.style.color = '#4ade80';
                 await loadProfile(state.nickname);
                 profilePassword.value = '';
+                setTimeout(() => { profileMessage.textContent = ''; }, 3000);
+            } else {
+                profileMessage.textContent = '❌ Ошибка сохранения';
+                profileMessage.style.color = '#f87171';
             }
         }
 
@@ -938,52 +1686,35 @@ HTML_TEMPLATE = """
 
                 if (!response.ok) {
                     const error = await response.json();
-                    showProfileMessage(error.detail || 'Ошибка загрузки аватара', 'error');
+                    console.error('Avatar upload error:', error);
                     return;
                 }
 
                 const result = await response.json();
                 state.profile.avatar = result.avatar;
                 updateProfileUI();
-                showProfileMessage('✅ Аватар обновлён!', 'success');
                 
-                // Обновляем отображение в чате
-                const messages = messagesContainer.querySelectorAll('.message .avatar');
-                // (обновление всех аватаров - сложно, перезагрузим сообщения)
-                // В реальном приложении лучше отправлять событие через WebSocket
+                profileMessage.textContent = '✅ Аватар обновлён!';
+                profileMessage.style.color = '#4ade80';
+                setTimeout(() => { profileMessage.textContent = ''; }, 3000);
 
             } catch (error) {
                 console.error('Avatar upload error:', error);
-                showProfileMessage('Ошибка загрузки аватара', 'error');
             }
         }
 
-        function showProfileMessage(text, type) {
-            profileMessage.textContent = text;
-            profileMessage.className = `mt-2 text-sm ${type === 'error' ? 'text-red-400' : 'text-green-400'}`;
-            profileMessage.style.display = 'block';
-            setTimeout(() => {
-                profileMessage.style.display = 'none';
-            }, 5000);
-        }
-
-        function showNotification(text, type = 'info') {
-            // Простое уведомление - можно улучшить
-            console.log(`[${type}]`, text);
-        }
-
         // ============================================
-        // UI ОБНОВЛЕНИЯ
+        // UI UPDATES
         // ============================================
         function updateConnectionStatus(connected) {
             if (connected) {
-                connectionStatus.className = 'connection-status connected bg-green-500/10 text-green-400 border-b border-green-500/20 px-6 py-2 text-center text-sm font-medium';
+                connectionStatus.className = 'connection-status connected';
                 connectionStatus.textContent = '✅ Соединение установлено';
                 setTimeout(() => {
                     connectionStatus.style.display = 'none';
-                }, 3000);
+                }, 2000);
             } else {
-                connectionStatus.className = 'connection-status disconnected bg-red-500/10 text-red-400 border-b border-red-500/20 px-6 py-2 text-center text-sm font-medium';
+                connectionStatus.className = 'connection-status disconnected';
                 connectionStatus.textContent = '⚠️ Нет соединения с сервером...';
                 connectionStatus.style.display = 'block';
             }
@@ -995,12 +1726,8 @@ HTML_TEMPLATE = """
             if (enabled) messageInput.focus();
         }
 
-        function updateOnlineCount(count) {
-            onlineCount.textContent = `🟢 ${count}`;
-        }
-
         // ============================================
-        // ВХОД И ВЫХОД
+        // JOIN / LEAVE
         // ============================================
         function joinChat(nickname) {
             state.nickname = nickname;
@@ -1027,7 +1754,7 @@ HTML_TEMPLATE = """
         }
 
         // ============================================
-        // РЕГИСТРАЦИЯ
+        // REGISTER
         // ============================================
         async function registerUser() {
             const nickname = regNickname.value.trim();
@@ -1046,24 +1773,10 @@ HTML_TEMPLATE = """
                 return;
             }
 
-            // Проверяем, существует ли пользователь
-            try {
-                const response = await fetch(`/api/profile/${encodeURIComponent(nickname)}`);
-                if (response.ok) {
-                    regError.textContent = 'Пользователь с таким никнеймом уже существует';
-                    regError.style.display = 'block';
-                    return;
-                }
-            } catch (e) {}
-
-            // Создаём пользователя через WebSocket
             regError.style.display = 'none';
-            
-            // Входим с созданием профиля
             state.nickname = nickname;
-            // Отправляем join с паролем
+            
             connectWebSocket();
-            // Ждём подключения и отправляем join с паролем
             const checkConnection = setInterval(() => {
                 if (state.connected) {
                     clearInterval(checkConnection);
@@ -1073,7 +1786,6 @@ HTML_TEMPLATE = """
                         password: password || undefined,
                         email: email || undefined
                     });
-                    // Переключаем экран
                     loginScreen.style.display = 'none';
                     registerScreen.style.display = 'none';
                     chatScreen.style.display = 'flex';
@@ -1084,7 +1796,7 @@ HTML_TEMPLATE = """
         }
 
         // ============================================
-        // ОБРАБОТЧИКИ СОБЫТИЙ
+        // EVENT LISTENERS
         // ============================================
         joinBtn.addEventListener('click', () => {
             const nickname = nicknameInput.value.trim();
@@ -1140,7 +1852,6 @@ HTML_TEMPLATE = """
             }
         });
 
-        // Профиль
         profileBtn.addEventListener('click', () => {
             profileModal.classList.add('active');
             updateProfileUI();
@@ -1163,7 +1874,6 @@ HTML_TEMPLATE = """
             }
         });
 
-        // Регистрация
         showRegisterBtn.addEventListener('click', () => {
             loginScreen.style.display = 'none';
             registerScreen.style.display = 'flex';
@@ -1180,190 +1890,15 @@ HTML_TEMPLATE = """
             if (e.key === 'Enter') registerBtn.click();
         });
 
-        regPassword.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') registerBtn.click();
-        });
-
         // ============================================
-        // ИНИЦИАЛИЗАЦИЯ
+        // INIT
         // ============================================
         nicknameInput.focus();
-
-        console.log('💬 Global Chat Pro loaded!');
-        console.log('✨ Features: Files, Images, Profiles, User registration');
+        console.log('💬 Global Chat loaded!');
     </script>
 </body>
 </html>
 """
-
-# ============================================
-# WEBSOCKET ЭНДПОИНТ (обновлённый)
-# ============================================
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    
-    nickname = None
-    user_data = {"nickname": "Anonymous", "last_message_time": 0}
-    
-    try:
-        # Ожидаем join сообщение
-        data = await websocket.receive_text()
-        try:
-            join_data = json.loads(data)
-            if join_data.get("type") == "join" and join_data.get("nickname"):
-                nickname = join_data["nickname"].strip()[:20]
-                
-                if nickname.lower() == "system":
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Никнейм 'System' зарезервирован"
-                    }))
-                    await websocket.close(code=1008)
-                    return
-                
-                # Проверяем пароль если есть
-                password = join_data.get("password")
-                email = join_data.get("email")
-                
-                # Проверяем существование пользователя
-                profile = chat_state.get_user_profile(nickname)
-                
-                if profile:
-                    # Проверяем пароль
-                    if profile.password_hash:
-                        if not password or not chat_state.verify_password(nickname, password):
-                            await websocket.send_text(json.dumps({
-                                "type": "error",
-                                "message": "Неверный пароль"
-                            }))
-                            await websocket.close(code=1008)
-                            return
-                else:
-                    # Создаём нового пользователя
-                    chat_state.create_user(nickname, password)
-                    if email:
-                        chat_state.update_profile(nickname, email=email)
-                
-                user_data["nickname"] = nickname
-                profile.last_seen = time.time()
-                chat_state.save_data()
-            else:
-                await websocket.close(code=1008)
-                return
-        except json.JSONDecodeError:
-            await websocket.close(code=1008)
-            return
-
-        # Проверяем, что никнейм не занят в чате
-        if nickname in chat_state.nicknames:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"Никнейм '{nickname}' уже в чате"
-            }))
-            await websocket.close(code=1008)
-            return
-
-        # Регистрируем в чате
-        chat_state.active_connections[websocket] = user_data
-        chat_state.nicknames.add(nickname)
-        
-        # Отправляем историю
-        await websocket.send_text(json.dumps({
-            "type": "history",
-            "messages": chat_state.get_messages()
-        }))
-
-        # Оповещаем о новом пользователе
-        system_msg = chat_state.add_message(
-            "System",
-            f"👋 {nickname} присоединился к чату",
-            is_system=True
-        )
-        await broadcast_message(system_msg)
-        await broadcast_online_count()
-
-        # Основной цикл
-        while True:
-            try:
-                data = await websocket.receive_text()
-                try:
-                    message_data = json.loads(data)
-                    if message_data.get("type") == "message":
-                        text = message_data.get("text", "").strip()
-                        file_info = message_data.get("file")
-                        
-                        if text or file_info:
-                            if chat_state.is_rate_limited(websocket):
-                                await websocket.send_text(json.dumps({
-                                    "type": "error",
-                                    "message": "Слишком много сообщений!"
-                                }))
-                                continue
-                            
-                            msg = chat_state.add_message(nickname, text, file_info=file_info)
-                            await broadcast_message(msg)
-                            
-                except json.JSONDecodeError:
-                    pass
-                    
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                print(f"Error in message loop: {e}")
-                break
-
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if websocket in chat_state.active_connections:
-            del chat_state.active_connections[websocket]
-        if nickname and nickname in chat_state.nicknames:
-            chat_state.nicknames.remove(nickname)
-        
-        if nickname:
-            system_msg = chat_state.add_message(
-                "System",
-                f"👋 {nickname} покинул чат",
-                is_system=True
-            )
-            await broadcast_message(system_msg)
-            await broadcast_online_count()
-
-# ============================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================
-async def broadcast_message(message: dict):
-    if not chat_state.active_connections:
-        return
-    
-    data = json.dumps({"type": "message", "message": message})
-    disconnected = []
-    
-    for connection in chat_state.active_connections.keys():
-        try:
-            await connection.send_text(data)
-        except Exception:
-            disconnected.append(connection)
-    
-    for conn in disconnected:
-        if conn in chat_state.active_connections:
-            del chat_state.active_connections[conn]
-
-async def broadcast_online_count():
-    count = chat_state.get_online_count()
-    data = json.dumps({"type": "online_count", "count": count})
-    disconnected = []
-    
-    for connection in chat_state.active_connections.keys():
-        try:
-            await connection.send_text(data)
-        except Exception:
-            disconnected.append(connection)
-    
-    for conn in disconnected:
-        if conn in chat_state.active_connections:
-            del chat_state.active_connections[conn]
 
 # ============================================
 # ЗАПУСК
