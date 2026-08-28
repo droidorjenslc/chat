@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 MAX_MESSAGES = 100
 RATE_LIMIT_SECONDS = 1
 MAX_FILE_SIZE = 10 * 1024 * 1024
+MIN_PASSWORD_LENGTH = 4
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.pdf', '.doc', '.docx', '.txt', '.zip', '.rar'}
 
 BASE_DIR = Path(__file__).parent
@@ -42,6 +43,7 @@ class UserProfile:
         self.email = ""
         self.created_at = time.time()
         self.last_seen = time.time()
+        self.is_online = False
     
     def to_dict(self):
         return {
@@ -52,7 +54,8 @@ class UserProfile:
             "phone": self.phone,
             "email": self.email,
             "created_at": self.created_at,
-            "last_seen": self.last_seen
+            "last_seen": self.last_seen,
+            "is_online": self.is_online
         }
 
 class ChatState:
@@ -66,9 +69,11 @@ class ChatState:
         if not self.messages:
             self.add_message("System", "🚀 Добро пожаловать в Global Chat!", is_system=True)
 
-    def add_message(self, nickname: str, text: str, is_system: bool = False, file_info: Optional[Dict] = None):
+    def add_message(self, nickname: str, text: str, is_system: bool = False, file_info: Optional[Dict] = None, message_id: Optional[str] = None):
+        if message_id is None:
+            message_id = f"msg_{int(time.time() * 1000)}_{len(self.messages)}"
         message = {
-            "id": f"msg_{int(time.time() * 1000)}_{len(self.messages)}",
+            "id": message_id,
             "nickname": nickname,
             "text": text,
             "timestamp": time.time(),
@@ -78,6 +83,19 @@ class ChatState:
         self.messages.append(message)
         self.save_data()
         return message
+
+    def delete_message(self, message_id: str, nickname: str) -> bool:
+        """Удаляет сообщение, если оно принадлежит пользователю"""
+        for i, msg in enumerate(self.messages):
+            if msg.get("id") == message_id:
+                if msg.get("nickname") == nickname:
+                    # Помечаем как удалённое
+                    self.messages[i]["text"] = "🗑️ Сообщение удалено"
+                    self.messages[i]["deleted"] = True
+                    self.save_data()
+                    return True
+                return False
+        return False
 
     def get_messages(self) -> List[Dict]:
         return list(self.messages)
@@ -98,10 +116,11 @@ class ChatState:
     def get_user_profile(self, nickname: str) -> Optional[UserProfile]:
         return self.users.get(nickname)
 
-    def create_user(self, nickname: str, password: Optional[str] = None) -> UserProfile:
+    def create_user(self, nickname: str, password: str) -> UserProfile:
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
         profile = UserProfile(nickname)
-        if password:
-            profile.password_hash = hashlib.sha256(password.encode()).hexdigest()
+        profile.password_hash = hashlib.sha256(password.encode()).hexdigest()
         self.users[nickname] = profile
         self.save_data()
         return profile
@@ -121,6 +140,9 @@ class ChatState:
             self.save_data()
             return True
         return False
+
+    def user_exists(self, nickname: str) -> bool:
+        return nickname in self.users
 
     def save_data(self):
         data = {
@@ -232,6 +254,8 @@ async def update_profile(nickname: str = Form(...), field: str = Form(...), valu
     
     if field == "password":
         if value:
+            if len(value) < MIN_PASSWORD_LENGTH:
+                raise HTTPException(status_code=400, detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
             profile.password_hash = hashlib.sha256(value.encode()).hexdigest()
         else:
             profile.password_hash = None
@@ -292,6 +316,7 @@ async def websocket_endpoint(websocket: WebSocket):
             join_data = json.loads(data)
             if join_data.get("type") == "join" and join_data.get("nickname"):
                 nickname = join_data["nickname"].strip()[:20]
+                password = join_data.get("password")
                 
                 if nickname.lower() == "system":
                     await websocket.send_text(json.dumps({
@@ -301,26 +326,37 @@ async def websocket_endpoint(websocket: WebSocket):
                     await websocket.close(code=1008)
                     return
                 
-                password = join_data.get("password")
-                email = join_data.get("email")
-                
-                profile = chat_state.get_user_profile(nickname)
-                
-                if profile:
-                    if profile.password_hash:
-                        if not password or not chat_state.verify_password(nickname, password):
-                            await websocket.send_text(json.dumps({
-                                "type": "error",
-                                "message": "Неверный пароль"
-                            }))
-                            await websocket.close(code=1008)
-                            return
+                # Проверяем существование пользователя
+                if chat_state.user_exists(nickname):
+                    # Авторизация
+                    if not password:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Требуется пароль"
+                        }))
+                        await websocket.close(code=1008)
+                        return
+                    if not chat_state.verify_password(nickname, password):
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Неверный пароль"
+                        }))
+                        await websocket.close(code=1008)
+                        return
                 else:
+                    # Регистрация
+                    if not password or len(password) < MIN_PASSWORD_LENGTH:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": f"Пароль должен быть минимум {MIN_PASSWORD_LENGTH} символов"
+                        }))
+                        await websocket.close(code=1008)
+                        return
                     chat_state.create_user(nickname, password)
-                    if email:
-                        chat_state.update_profile(nickname, email=email)
                 
                 user_data["nickname"] = nickname
+                profile = chat_state.get_user_profile(nickname)
+                profile.is_online = True
                 profile.last_seen = time.time()
                 chat_state.save_data()
             else:
@@ -359,7 +395,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = await websocket.receive_text()
                 try:
                     message_data = json.loads(data)
-                    if message_data.get("type") == "message":
+                    msg_type = message_data.get("type")
+                    
+                    if msg_type == "message":
                         text = message_data.get("text", "").strip()
                         file_info = message_data.get("file")
                         
@@ -373,6 +411,43 @@ async def websocket_endpoint(websocket: WebSocket):
                             
                             msg = chat_state.add_message(nickname, text, file_info=file_info)
                             await broadcast_message(msg)
+                    
+                    elif msg_type == "delete":
+                        message_id = message_data.get("message_id")
+                        if message_id:
+                            success = chat_state.delete_message(message_id, nickname)
+                            if success:
+                                await broadcast_message({
+                                    "id": message_id,
+                                    "deleted": True,
+                                    "nickname": nickname
+                                }, is_delete=True)
+                            else:
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "message": "Нельзя удалить это сообщение"
+                                }))
+                    
+                    elif msg_type == "edit":
+                        message_id = message_data.get("message_id")
+                        new_text = message_data.get("text", "").strip()
+                        if message_id and new_text:
+                            # Находим и редактируем сообщение
+                            for msg in chat_state.messages:
+                                if msg.get("id") == message_id and msg.get("nickname") == nickname:
+                                    msg["text"] = new_text
+                                    msg["edited"] = True
+                                    msg["edited_at"] = time.time()
+                                    chat_state.save_data()
+                                    await broadcast_message(msg, is_edit=True)
+                                    break
+                    
+                    elif msg_type == "mention":
+                        target = message_data.get("target")
+                        if target:
+                            # Отправляем уведомление конкретному пользователю
+                            await send_mention_notification(nickname, target, message_data.get("text", ""))
+                    
                 except json.JSONDecodeError:
                     pass
             except WebSocketDisconnect:
@@ -390,6 +465,12 @@ async def websocket_endpoint(websocket: WebSocket):
             chat_state.nicknames.remove(nickname)
         
         if nickname:
+            profile = chat_state.get_user_profile(nickname)
+            if profile:
+                profile.is_online = False
+                profile.last_seen = time.time()
+                chat_state.save_data()
+            
             system_msg = chat_state.add_message(
                 "System",
                 f"👋 {nickname} покинул чат",
@@ -398,13 +479,18 @@ async def websocket_endpoint(websocket: WebSocket):
             await broadcast_message(system_msg)
             await broadcast_online_count()
 
-async def broadcast_message(message: dict):
+async def broadcast_message(message: dict, is_delete: bool = False, is_edit: bool = False):
     if not chat_state.active_connections:
         return
     
-    data = json.dumps({"type": "message", "message": message})
-    disconnected = []
+    if is_delete:
+        data = json.dumps({"type": "delete", "message": message})
+    elif is_edit:
+        data = json.dumps({"type": "edit", "message": message})
+    else:
+        data = json.dumps({"type": "message", "message": message})
     
+    disconnected = []
     for connection in chat_state.active_connections.keys():
         try:
             await connection.send_text(data)
@@ -414,6 +500,25 @@ async def broadcast_message(message: dict):
     for conn in disconnected:
         if conn in chat_state.active_connections:
             del chat_state.active_connections[conn]
+
+async def send_mention_notification(from_user: str, to_user: str, text: str):
+    """Отправляет уведомление о упоминании"""
+    notification = {
+        "type": "mention",
+        "from": from_user,
+        "to": to_user,
+        "text": text,
+        "timestamp": time.time()
+    }
+    
+    data = json.dumps(notification)
+    for connection, user_data in chat_state.active_connections.items():
+        if user_data.get("nickname") == to_user:
+            try:
+                await connection.send_text(data)
+                break
+            except Exception:
+                pass
 
 async def broadcast_online_count():
     count = chat_state.get_online_count()
@@ -431,7 +536,7 @@ async def broadcast_online_count():
             del chat_state.active_connections[conn]
 
 # ============================================
-# HTML ФРОНТЕНД (СТИЛЬ TELEGRAM/DISCORD)
+# HTML ФРОНТЕНД
 # ============================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -443,707 +548,152 @@ HTML_TEMPLATE = """
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0e0e10; height: 100vh; overflow: hidden; color: #e4e4e7; }
+        
+        /* Login */
+        #login-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; background: linear-gradient(135deg, #0e0e10 0%, #1a1a2e 100%); }
+        .login-card { background: rgba(30, 30, 46, 0.9); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.06); padding: 2.5rem; border-radius: 1.5rem; width: 100%; max-width: 400px; box-shadow: 0 25px 60px rgba(0,0,0,0.8); }
+        .login-card h1 { font-size: 2.2rem; font-weight: 700; background: linear-gradient(135deg, #5865f2, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-align: center; margin-bottom: 0.5rem; }
+        .login-card .subtitle { color: #8e8ea0; text-align: center; margin-bottom: 2rem; font-size: 0.95rem; }
+        .login-card input { width: 100%; padding: 0.75rem 1rem; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 0.75rem; color: #e4e4e7; font-size: 1rem; transition: all 0.3s; margin-bottom: 0.5rem; }
+        .login-card input:focus { outline: none; border-color: #5865f2; box-shadow: 0 0 0 3px rgba(88,101,242,0.15); }
+        .login-card input::placeholder { color: #6e6e80; }
+        .login-card .btn-join { width: 100%; padding: 0.75rem; background: linear-gradient(135deg, #5865f2, #7c6df0); color: white; border: none; border-radius: 0.75rem; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.3s; margin-top: 0.5rem; }
+        .login-card .btn-join:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(88,101,242,0.3); }
+        .login-card .btn-link { background: none; border: none; color: #8e8ea0; font-size: 0.85rem; cursor: pointer; transition: color 0.3s; margin-top: 0.75rem; display: block; width: 100%; text-align: center; }
+        .login-card .btn-link:hover { color: #e4e4e7; }
+        .login-card .error { color: #f87171; font-size: 0.85rem; margin-top: 0.25rem; display: none; }
+        
+        /* Chat */
+        #chat-screen { display: none; flex-direction: column; height: 100vh; background: #0e0e10; }
+        .chat-header { background: rgba(30,30,46,0.95); backdrop-filter: blur(10px); border-bottom: 1px solid rgba(255,255,255,0.05); padding: 0.75rem 1.5rem; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; z-index: 10; flex-wrap: wrap; gap: 0.5rem; }
+        .chat-header .left { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+        .chat-header .title { font-size: 1.1rem; font-weight: 600; color: #e4e4e7; }
+        .chat-header .online-badge { display: flex; align-items: center; gap: 0.4rem; background: rgba(88,101,242,0.15); color: #a78bfa; font-size: 0.75rem; padding: 0.25rem 0.75rem; border-radius: 9999px; font-weight: 500; }
+        .chat-header .online-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: #4ade80; animation: pulse-dot 2s infinite; }
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .chat-header .right { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+        .chat-header .right .user-name { color: #8e8ea0; font-size: 0.85rem; }
+        .chat-header .right .user-name span { color: #e4e4e7; font-weight: 500; }
+        .chat-header .right .icon-btn { background: none; border: none; color: #8e8ea0; font-size: 1.1rem; cursor: pointer; padding: 0.4rem; border-radius: 0.5rem; transition: all 0.3s; }
+        .chat-header .right .icon-btn:hover { color: #e4e4e7; background: rgba(255,255,255,0.05); }
+        .chat-header .right .leave-btn { background: rgba(239,68,68,0.15); color: #f87171; padding: 0.25rem 0.75rem; border-radius: 9999px; border: none; font-size: 0.75rem; cursor: pointer; transition: all 0.3s; }
+        .chat-header .right .leave-btn:hover { background: rgba(239,68,68,0.25); }
+        
+        .connection-status { padding: 0.4rem 1.5rem; text-align: center; font-size: 0.8rem; font-weight: 500; display: none; flex-shrink: 0; }
+        .connection-status.connected { background: rgba(74,222,128,0.08); color: #4ade80; border-bottom: 1px solid rgba(74,222,128,0.1); display: block; }
+        .connection-status.disconnected { background: rgba(239,68,68,0.08); color: #f87171; border-bottom: 1px solid rgba(239,68,68,0.1); display: block; }
+        
+        .messages-container { flex: 1; overflow-y: auto; padding: 1rem 1.5rem; display: flex; flex-direction: column; gap: 0.15rem; scroll-behavior: smooth; }
+        .messages-container::-webkit-scrollbar { width: 5px; }
+        .messages-container::-webkit-scrollbar-track { background: transparent; }
+        .messages-container::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 9999px; }
+        .messages-container::-webkit-scrollbar-thumb:hover { background: #3a3a4a; }
+        
+        .message { display: flex; align-items: flex-start; gap: 0.6rem; padding: 0.2rem 0; animation: fadeIn 0.15s ease-in; position: relative; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        .message .avatar { width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.75rem; color: white; text-transform: uppercase; overflow: hidden; background: #2a2a3a; cursor: pointer; }
+        .message .avatar img { width: 100%; height: 100%; object-fit: cover; }
+        .message .content { flex: 1; min-width: 0; padding-top: 0.15rem; }
+        .message .content .msg-header { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+        .message .content .msg-nickname { font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: color 0.2s; }
+        .message .content .msg-nickname:hover { text-decoration: underline; }
+        .message .content .msg-time { color: #5e5e70; font-size: 0.65rem; }
+        .message .content .msg-text { color: #d4d4d8; font-size: 0.92rem; word-wrap: break-word; overflow-wrap: break-word; line-height: 1.4; }
+        .message .content .msg-text.deleted { color: #6e6e80; font-style: italic; }
+        .message .content .msg-actions { display: flex; gap: 0.5rem; margin-top: 0.15rem; opacity: 0; transition: opacity 0.2s; }
+        .message:hover .content .msg-actions { opacity: 1; }
+        .message .content .msg-actions button { background: none; border: none; color: #6e6e80; font-size: 0.7rem; cursor: pointer; padding: 0.1rem 0.3rem; border-radius: 0.25rem; transition: all 0.2s; }
+        .message .content .msg-actions button:hover { color: #e4e4e7; background: rgba(255,255,255,0.05); }
+        .message .content .msg-actions .delete-btn:hover { color: #f87171; }
+        .message .content .msg-actions .edit-btn:hover { color: #60a5fa; }
+        .message .content .msg-edit-indicator { color: #6e6e80; font-size: 0.65rem; font-style: italic; margin-left: 0.5rem; }
+        .message.system { justify-content: center; }
+        .message.system .content .msg-text { color: #6e6e80; font-size: 0.8rem; font-style: italic; text-align: center; }
+        .message.system .avatar { display: none; }
+        .message.system .content .msg-actions { display: none; }
+        
+        .file-attachment { display: inline-flex; align-items: center; gap: 0.5rem; background: rgba(255,255,255,0.04); padding: 0.4rem 0.75rem; border-radius: 0.5rem; margin-top: 0.2rem; cursor: pointer; transition: all 0.3s; border: 1px solid rgba(255,255,255,0.04); }
+        .file-attachment:hover { background: rgba(255,255,255,0.08); }
+        .file-attachment i { font-size: 1rem; color: #8e8ea0; }
+        .file-attachment .file-name { color: #d4d4d8; font-size: 0.8rem; }
+        .file-attachment .file-size { color: #6e6e80; font-size: 0.7rem; }
+        .file-attachment .download-link { color: #5865f2; text-decoration: none; font-size: 0.8rem; }
+        .file-attachment .download-link:hover { color: #7c6df0; }
+        .message-image { max-width: 280px; max-height: 280px; border-radius: 0.5rem; cursor: pointer; margin-top: 0.2rem; transition: transform 0.2s; border: 1px solid rgba(255,255,255,0.04); }
+        .message-image:hover { transform: scale(1.02); }
+        
+        .input-area { background: rgba(30,30,46,0.95); backdrop-filter: blur(10px); border-top: 1px solid rgba(255,255,255,0.04); padding: 0.6rem 1rem; display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; }
+        .input-area .input-wrapper { flex: 1; display: flex; align-items: center; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 0.75rem; padding: 0 0.5rem; transition: all 0.3s; }
+        .input-area .input-wrapper:focus-within { border-color: #5865f2; box-shadow: 0 0 0 3px rgba(88,101,242,0.1); }
+        .input-area .input-wrapper .icon-btn { background: none; border: none; color: #6e6e80; font-size: 1rem; cursor: pointer; padding: 0.4rem; border-radius: 0.4rem; transition: all 0.3s; }
+        .input-area .input-wrapper .icon-btn:hover { color: #e4e4e7; background: rgba(255,255,255,0.05); }
+        .input-area .input-wrapper input { flex: 1; background: transparent; border: none; color: #e4e4e7; padding: 0.6rem 0.3rem; font-size: 0.92rem; min-width: 0; }
+        .input-area .input-wrapper input:focus { outline: none; }
+        .input-area .input-wrapper input::placeholder { color: #6e6e80; }
+        .input-area .input-wrapper input:disabled { opacity: 0.5; cursor: not-allowed; }
+        .input-area .btn-send { background: linear-gradient(135deg, #5865f2, #7c6df0); color: white; padding: 0.6rem 1.2rem; border: none; border-radius: 0.75rem; font-weight: 600; font-size: 0.9rem; cursor: pointer; transition: all 0.3s; white-space: nowrap; }
+        .input-area .btn-send:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(88,101,242,0.3); }
+        .input-area .btn-send:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+        
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(8px); z-index: 1000; justify-content: center; align-items: center; }
+        .modal.active { display: flex; }
+        .modal-content { max-width: 90%; max-height: 90%; border-radius: 0.5rem; }
+        .modal-close { position: fixed; top: 20px; right: 30px; color: #8e8ea0; font-size: 2rem; cursor: pointer; z-index: 1001; transition: color 0.3s; }
+        .modal-close:hover { color: #e4e4e7; }
+        
+        .profile-modal .modal-content { background: #1e1e2e; color: #e4e4e7; padding: 2rem; border-radius: 1rem; max-width: 500px; width: 90%; max-height: 90vh; overflow-y: auto; }
+        .profile-modal .modal-content h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem; }
+        .profile-modal .form-group { margin-bottom: 1rem; }
+        .profile-modal .form-group label { display: block; color: #8e8ea0; font-size: 0.8rem; margin-bottom: 0.25rem; }
+        .profile-modal .form-group input, .profile-modal .form-group textarea { width: 100%; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); color: #e4e4e7; padding: 0.5rem 0.75rem; border-radius: 0.5rem; font-size: 0.9rem; transition: all 0.3s; }
+        .profile-modal .form-group input:focus, .profile-modal .form-group textarea:focus { outline: none; border-color: #5865f2; }
+        .profile-modal .avatar-upload { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }
+        .profile-modal .current-avatar { width: 64px; height: 64px; border-radius: 50%; object-fit: cover; background: #2a2a3a; }
+        .profile-modal .btn { padding: 0.4rem 1.2rem; border-radius: 0.5rem; border: none; font-weight: 500; font-size: 0.85rem; cursor: pointer; transition: all 0.3s; }
+        .profile-modal .btn-primary { background: linear-gradient(135deg, #5865f2, #7c6df0); color: white; }
+        .profile-modal .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(88,101,242,0.3); }
+        .profile-modal .btn-secondary { background: rgba(255,255,255,0.06); color: #e4e4e7; }
+        .profile-modal .btn-secondary:hover { background: rgba(255,255,255,0.1); }
+        .profile-modal .btn-sm { padding: 0.25rem 0.75rem; font-size: 0.75rem; }
+        .file-input-wrapper { position: relative; overflow: hidden; display: inline-block; }
+        .file-input-wrapper input[type=file] { position: absolute; left: 0; top: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; }
+        .profile-modal .btn-group { display: flex; gap: 0.75rem; margin-top: 1.5rem; }
+        #profile-message { margin-top: 0.75rem; font-size: 0.85rem; }
+        
+        /* User profile view modal */
+        .user-profile-modal .modal-content { background: #1e1e2e; color: #e4e4e7; padding: 2rem; border-radius: 1rem; max-width: 400px; width: 90%; text-align: center; }
+        .user-profile-modal .modal-content .big-avatar { width: 80px; height: 80px; border-radius: 50%; object-fit: cover; margin: 0 auto 1rem; background: #2a2a3a; }
+        .user-profile-modal .modal-content .user-name { font-size: 1.3rem; font-weight: 600; margin-bottom: 0.25rem; }
+        .user-profile-modal .modal-content .user-status { font-size: 0.85rem; color: #8e8ea0; margin-bottom: 1rem; }
+        .user-profile-modal .modal-content .user-info { color: #d4d4d8; font-size: 0.9rem; margin-bottom: 0.5rem; }
+        .user-profile-modal .modal-content .user-contact { color: #8e8ea0; font-size: 0.85rem; }
+        .user-profile-modal .modal-content .user-contact i { margin-right: 0.5rem; }
+        .user-profile-modal .modal-content .btn-close { margin-top: 1.5rem; }
+        
+        /* Mention highlight */
+        .mention-highlight { background: rgba(88,101,242,0.2); padding: 0.1rem 0.3rem; border-radius: 0.25rem; }
+        .message.mentioned { background: rgba(88,101,242,0.05); border-left: 3px solid #5865f2; padding-left: 0.5rem; }
+        
+        .toast { position: fixed; top: 20px; right: 20px; z-index: 2000; background: #1e1e2e; border: 1px solid rgba(255,255,255,0.1); padding: 1rem 1.5rem; border-radius: 0.75rem; max-width: 350px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); animation: slideIn 0.3s ease; }
+        .toast .toast-title { font-weight: 600; font-size: 0.9rem; color: #a78bfa; }
+        .toast .toast-text { font-size: 0.85rem; color: #d4d4d8; margin-top: 0.25rem; }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(50px); } to { opacity: 1; transform: translateX(0); } }
         
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #0e0e10;
-            height: 100vh;
-            overflow: hidden;
-            color: #e4e4e7;
-        }
-        
-        /* ===== LOGIN SCREEN ===== */
-        #login-screen {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            background: linear-gradient(135deg, #0e0e10 0%, #1a1a2e 100%);
-        }
-        
-        .login-card {
-            background: rgba(30, 30, 46, 0.9);
-            backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            padding: 2.5rem;
-            border-radius: 1.5rem;
-            width: 100%;
-            max-width: 400px;
-            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8);
-        }
-        
-        .login-card h1 {
-            font-size: 2.2rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #5865f2, #a78bfa);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            text-align: center;
-            margin-bottom: 0.5rem;
-        }
-        
-        .login-card .subtitle {
-            color: #8e8ea0;
-            text-align: center;
-            margin-bottom: 2rem;
-            font-size: 0.95rem;
-        }
-        
-        .login-card input {
-            width: 100%;
-            padding: 0.75rem 1rem;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 0.75rem;
-            color: #e4e4e7;
-            font-size: 1rem;
-            transition: all 0.3s;
-        }
-        
-        .login-card input:focus {
-            outline: none;
-            border-color: #5865f2;
-            box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.15);
-        }
-        
-        .login-card input::placeholder {
-            color: #6e6e80;
-        }
-        
-        .login-card .btn-join {
-            width: 100%;
-            padding: 0.75rem;
-            background: linear-gradient(135deg, #5865f2, #7c6df0);
-            color: white;
-            border: none;
-            border-radius: 0.75rem;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 1rem;
-        }
-        
-        .login-card .btn-join:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 25px rgba(88, 101, 242, 0.3);
-        }
-        
-        .login-card .btn-link {
-            background: none;
-            border: none;
-            color: #8e8ea0;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: color 0.3s;
-            margin-top: 0.75rem;
-        }
-        
-        .login-card .btn-link:hover {
-            color: #e4e4e7;
-        }
-        
-        /* ===== CHAT SCREEN ===== */
-        #chat-screen {
-            display: none;
-            flex-direction: column;
-            height: 100vh;
-            background: #0e0e10;
-        }
-        
-        /* Header */
-        .chat-header {
-            background: rgba(30, 30, 46, 0.95);
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            padding: 0.75rem 1.5rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-shrink: 0;
-            z-index: 10;
-        }
-        
-        .chat-header .left {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-        }
-        
-        .chat-header .title {
-            font-size: 1.1rem;
-            font-weight: 600;
-            color: #e4e4e7;
-        }
-        
-        .chat-header .online-badge {
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-            background: rgba(88, 101, 242, 0.15);
-            color: #a78bfa;
-            font-size: 0.75rem;
-            padding: 0.25rem 0.75rem;
-            border-radius: 9999px;
-            font-weight: 500;
-        }
-        
-        .chat-header .online-badge .dot {
-            width: 6px;
-            height: 6px;
-            border-radius: 50%;
-            background: #4ade80;
-            animation: pulse-dot 2s infinite;
-        }
-        
-        @keyframes pulse-dot {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.4; }
-        }
-        
-        .chat-header .right {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-        }
-        
-        .chat-header .right .user-name {
-            color: #8e8ea0;
-            font-size: 0.85rem;
-        }
-        
-        .chat-header .right .user-name span {
-            color: #e4e4e7;
-            font-weight: 500;
-        }
-        
-        .chat-header .right .icon-btn {
-            background: none;
-            border: none;
-            color: #8e8ea0;
-            font-size: 1.1rem;
-            cursor: pointer;
-            padding: 0.4rem;
-            border-radius: 0.5rem;
-            transition: all 0.3s;
-        }
-        
-        .chat-header .right .icon-btn:hover {
-            color: #e4e4e7;
-            background: rgba(255, 255, 255, 0.05);
-        }
-        
-        .chat-header .right .leave-btn {
-            background: rgba(239, 68, 68, 0.15);
-            color: #f87171;
-            padding: 0.25rem 0.75rem;
-            border-radius: 9999px;
-            border: none;
-            font-size: 0.75rem;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        
-        .chat-header .right .leave-btn:hover {
-            background: rgba(239, 68, 68, 0.25);
-        }
-        
-        /* Connection Status */
-        .connection-status {
-            padding: 0.4rem 1.5rem;
-            text-align: center;
-            font-size: 0.8rem;
-            font-weight: 500;
-            display: none;
-            flex-shrink: 0;
-        }
-        
-        .connection-status.connected {
-            background: rgba(74, 222, 128, 0.08);
-            color: #4ade80;
-            border-bottom: 1px solid rgba(74, 222, 128, 0.1);
-            display: block;
-        }
-        
-        .connection-status.disconnected {
-            background: rgba(239, 68, 68, 0.08);
-            color: #f87171;
-            border-bottom: 1px solid rgba(239, 68, 68, 0.1);
-            display: block;
-        }
-        
-        /* Messages Container */
-        .messages-container {
-            flex: 1;
-            overflow-y: auto;
-            padding: 1rem 1.5rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.15rem;
-            scroll-behavior: smooth;
-        }
-        
-        .messages-container::-webkit-scrollbar {
-            width: 5px;
-        }
-        
-        .messages-container::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        
-        .messages-container::-webkit-scrollbar-thumb {
-            background: #2a2a3a;
-            border-radius: 9999px;
-        }
-        
-        .messages-container::-webkit-scrollbar-thumb:hover {
-            background: #3a3a4a;
-        }
-        
-        /* Message */
-        .message {
-            display: flex;
-            align-items: flex-start;
-            gap: 0.6rem;
-            padding: 0.2rem 0;
-            animation: fadeIn 0.15s ease-in;
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(5px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        .message .avatar {
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            flex-shrink: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 600;
-            font-size: 0.75rem;
-            color: white;
-            text-transform: uppercase;
-            overflow: hidden;
-            background: #2a2a3a;
-        }
-        
-        .message .avatar img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        
-        .message .content {
-            flex: 1;
-            min-width: 0;
-            padding-top: 0.15rem;
-        }
-        
-        .message .content .msg-header {
-            display: flex;
-            align-items: baseline;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-        
-        .message .content .msg-nickname {
-            font-weight: 600;
-            font-size: 0.85rem;
-            color: #e4e4e7;
-        }
-        
-        .message .content .msg-time {
-            color: #5e5e70;
-            font-size: 0.65rem;
-        }
-        
-        .message .content .msg-text {
-            color: #d4d4d8;
-            font-size: 0.92rem;
-            word-wrap: break-word;
-            overflow-wrap: break-word;
-            line-height: 1.4;
-        }
-        
-        .message.system {
-            justify-content: center;
-        }
-        
-        .message.system .content .msg-text {
-            color: #6e6e80;
-            font-size: 0.8rem;
-            font-style: italic;
-            text-align: center;
-        }
-        
-        .message.system .avatar {
-            display: none;
-        }
-        
-        /* File Attachment */
-        .file-attachment {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            background: rgba(255, 255, 255, 0.04);
-            padding: 0.4rem 0.75rem;
-            border-radius: 0.5rem;
-            margin-top: 0.2rem;
-            cursor: pointer;
-            transition: all 0.3s;
-            border: 1px solid rgba(255, 255, 255, 0.04);
-        }
-        
-        .file-attachment:hover {
-            background: rgba(255, 255, 255, 0.08);
-        }
-        
-        .file-attachment i {
-            font-size: 1rem;
-            color: #8e8ea0;
-        }
-        
-        .file-attachment .file-name {
-            color: #d4d4d8;
-            font-size: 0.8rem;
-        }
-        
-        .file-attachment .file-size {
-            color: #6e6e80;
-            font-size: 0.7rem;
-        }
-        
-        .file-attachment .download-link {
-            color: #5865f2;
-            text-decoration: none;
-            font-size: 0.8rem;
-        }
-        
-        .file-attachment .download-link:hover {
-            color: #7c6df0;
-        }
-        
-        .message-image {
-            max-width: 280px;
-            max-height: 280px;
-            border-radius: 0.5rem;
-            cursor: pointer;
-            margin-top: 0.2rem;
-            transition: transform 0.2s;
-            border: 1px solid rgba(255, 255, 255, 0.04);
-        }
-        
-        .message-image:hover {
-            transform: scale(1.02);
-        }
-        
-        /* Input Area */
-        .input-area {
-            background: rgba(30, 30, 46, 0.95);
-            backdrop-filter: blur(10px);
-            border-top: 1px solid rgba(255, 255, 255, 0.04);
-            padding: 0.6rem 1rem;
-            display: flex;
-            gap: 0.5rem;
-            align-items: center;
-            flex-shrink: 0;
-        }
-        
-        .input-area .input-wrapper {
-            flex: 1;
-            display: flex;
-            align-items: center;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            border-radius: 0.75rem;
-            padding: 0 0.5rem;
-            transition: all 0.3s;
-        }
-        
-        .input-area .input-wrapper:focus-within {
-            border-color: #5865f2;
-            box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.1);
-        }
-        
-        .input-area .input-wrapper .icon-btn {
-            background: none;
-            border: none;
-            color: #6e6e80;
-            font-size: 1rem;
-            cursor: pointer;
-            padding: 0.4rem;
-            border-radius: 0.4rem;
-            transition: all 0.3s;
-        }
-        
-        .input-area .input-wrapper .icon-btn:hover {
-            color: #e4e4e7;
-            background: rgba(255, 255, 255, 0.05);
-        }
-        
-        .input-area .input-wrapper input {
-            flex: 1;
-            background: transparent;
-            border: none;
-            color: #e4e4e7;
-            padding: 0.6rem 0.3rem;
-            font-size: 0.92rem;
-            min-width: 0;
-        }
-        
-        .input-area .input-wrapper input:focus {
-            outline: none;
-        }
-        
-        .input-area .input-wrapper input::placeholder {
-            color: #6e6e80;
-        }
-        
-        .input-area .input-wrapper input:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
-        .input-area .btn-send {
-            background: linear-gradient(135deg, #5865f2, #7c6df0);
-            color: white;
-            padding: 0.6rem 1.2rem;
-            border: none;
-            border-radius: 0.75rem;
-            font-weight: 600;
-            font-size: 0.9rem;
-            cursor: pointer;
-            transition: all 0.3s;
-            white-space: nowrap;
-        }
-        
-        .input-area .btn-send:hover:not(:disabled) {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 15px rgba(88, 101, 242, 0.3);
-        }
-        
-        .input-area .btn-send:disabled {
-            opacity: 0.4;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        /* Modals */
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.85);
-            backdrop-filter: blur(8px);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-        }
-        
-        .modal.active {
-            display: flex;
-        }
-        
-        .modal-content {
-            max-width: 90%;
-            max-height: 90%;
-            border-radius: 0.5rem;
-        }
-        
-        .modal-close {
-            position: fixed;
-            top: 20px;
-            right: 30px;
-            color: #8e8ea0;
-            font-size: 2rem;
-            cursor: pointer;
-            z-index: 1001;
-            transition: color 0.3s;
-        }
-        
-        .modal-close:hover {
-            color: #e4e4e7;
-        }
-        
-        /* Profile Modal */
-        .profile-modal .modal-content {
-            background: #1e1e2e;
-            color: #e4e4e7;
-            padding: 2rem;
-            border-radius: 1rem;
-            max-width: 500px;
-            width: 90%;
-            max-height: 90vh;
-            overflow-y: auto;
-        }
-        
-        .profile-modal .modal-content h2 {
-            font-size: 1.5rem;
-            font-weight: 700;
-            margin-bottom: 1.5rem;
-        }
-        
-        .profile-modal .form-group {
-            margin-bottom: 1rem;
-        }
-        
-        .profile-modal .form-group label {
-            display: block;
-            color: #8e8ea0;
-            font-size: 0.8rem;
-            margin-bottom: 0.25rem;
-        }
-        
-        .profile-modal .form-group input,
-        .profile-modal .form-group textarea {
-            width: 100%;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            color: #e4e4e7;
-            padding: 0.5rem 0.75rem;
-            border-radius: 0.5rem;
-            font-size: 0.9rem;
-            transition: all 0.3s;
-        }
-        
-        .profile-modal .form-group input:focus,
-        .profile-modal .form-group textarea:focus {
-            outline: none;
-            border-color: #5865f2;
-        }
-        
-        .profile-modal .avatar-upload {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
-        }
-        
-        .profile-modal .current-avatar {
-            width: 64px;
-            height: 64px;
-            border-radius: 50%;
-            object-fit: cover;
-            background: #2a2a3a;
-        }
-        
-        .profile-modal .btn {
-            padding: 0.4rem 1.2rem;
-            border-radius: 0.5rem;
-            border: none;
-            font-weight: 500;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        
-        .profile-modal .btn-primary {
-            background: linear-gradient(135deg, #5865f2, #7c6df0);
-            color: white;
-        }
-        
-        .profile-modal .btn-primary:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 15px rgba(88, 101, 242, 0.3);
-        }
-        
-        .profile-modal .btn-secondary {
-            background: rgba(255, 255, 255, 0.06);
-            color: #e4e4e7;
-        }
-        
-        .profile-modal .btn-secondary:hover {
-            background: rgba(255, 255, 255, 0.1);
-        }
-        
-        .profile-modal .btn-sm {
-            padding: 0.25rem 0.75rem;
-            font-size: 0.75rem;
-        }
-        
-        .file-input-wrapper {
-            position: relative;
-            overflow: hidden;
-            display: inline-block;
-        }
-        
-        .file-input-wrapper input[type=file] {
-            position: absolute;
-            left: 0;
-            top: 0;
-            opacity: 0;
-            width: 100%;
-            height: 100%;
-            cursor: pointer;
-        }
-        
-        .profile-modal .btn-group {
-            display: flex;
-            gap: 0.75rem;
-            margin-top: 1.5rem;
-        }
-        
-        #profile-message {
-            margin-top: 0.75rem;
-            font-size: 0.85rem;
-        }
-        
-        /* Responsive */
         @media (max-width: 640px) {
-            .chat-header {
-                padding: 0.5rem 0.75rem;
-            }
-            .chat-header .title {
-                font-size: 0.95rem;
-            }
-            .chat-header .right .user-name {
-                font-size: 0.75rem;
-            }
-            .messages-container {
-                padding: 0.5rem 0.75rem;
-            }
-            .input-area {
-                padding: 0.4rem 0.5rem;
-                gap: 0.3rem;
-            }
-            .input-area .input-wrapper input {
-                font-size: 0.85rem;
-                padding: 0.4rem 0.2rem;
-            }
-            .input-area .btn-send {
-                padding: 0.4rem 0.8rem;
-                font-size: 0.8rem;
-            }
-            .message .avatar {
-                width: 28px;
-                height: 28px;
-                font-size: 0.65rem;
-            }
-            .message .content .msg-text {
-                font-size: 0.85rem;
-            }
-            .message-image {
-                max-width: 200px;
-                max-height: 200px;
-            }
-            .login-card {
-                padding: 1.5rem;
-                margin: 0 1rem;
-            }
-            .profile-modal .modal-content {
-                padding: 1.5rem;
-            }
+            .chat-header { padding: 0.5rem 0.75rem; }
+            .chat-header .title { font-size: 0.95rem; }
+            .chat-header .right .user-name { font-size: 0.75rem; }
+            .messages-container { padding: 0.5rem 0.75rem; }
+            .input-area { padding: 0.4rem 0.5rem; gap: 0.3rem; }
+            .input-area .input-wrapper input { font-size: 0.85rem; padding: 0.4rem 0.2rem; }
+            .input-area .btn-send { padding: 0.4rem 0.8rem; font-size: 0.8rem; }
+            .message .avatar { width: 28px; height: 28px; font-size: 0.65rem; }
+            .message .content .msg-text { font-size: 0.85rem; }
+            .message-image { max-width: 200px; max-height: 200px; }
+            .login-card { padding: 1.5rem; margin: 0 1rem; }
+            .profile-modal .modal-content { padding: 1.5rem; }
         }
     </style>
 </head>
@@ -1152,31 +702,32 @@ HTML_TEMPLATE = """
     <div id="login-screen">
         <div class="login-card">
             <h1>💬 Global Chat</h1>
-            <p class="subtitle">Присоединяйтесь к общему чату</p>
-            <input type="text" id="nickname-input" placeholder="Введите никнейм..." maxlength="20" autofocus>
-            <div id="login-error" style="color: #f87171; font-size: 0.85rem; margin-top: 0.5rem; display: none;"></div>
-            <button class="btn-join" id="join-btn">Войти в чат</button>
-            <button class="btn-link" id="show-register-btn">🔑 Зарегистрироваться</button>
+            <p class="subtitle">Войдите или зарегистрируйтесь</p>
+            <input type="text" id="login-nickname" placeholder="Никнейм" maxlength="20" autofocus>
+            <input type="password" id="login-password" placeholder="Пароль (минимум 4 символа для регистрации)">
+            <div id="login-error" class="error"></div>
+            <button class="btn-join" id="login-btn">Войти</button>
+            <button class="btn-link" id="switch-to-register">Нет аккаунта? Зарегистрироваться</button>
         </div>
     </div>
 
     <!-- Register Screen -->
     <div id="register-screen" style="display:none;">
         <div class="login-card">
-            <h2 style="font-size: 1.8rem; font-weight: 700; text-align: center; color: #e4e4e7; margin-bottom: 0.25rem;">📝 Регистрация</h2>
-            <p class="subtitle">Создайте аккаунт</p>
-            <input type="text" id="reg-nickname" placeholder="Никнейм" maxlength="20" style="margin-bottom: 0.5rem;">
-            <input type="password" id="reg-password" placeholder="Пароль (опционально)" style="margin-bottom: 0.5rem;">
-            <input type="email" id="reg-email" placeholder="Email (опционально)" style="margin-bottom: 0.5rem;">
-            <div id="reg-error" style="color: #f87171; font-size: 0.85rem; margin-top: 0.5rem; display: none;"></div>
-            <button class="btn-join" id="register-btn">Создать аккаунт</button>
-            <button class="btn-link" id="back-to-login-btn" style="display: block; margin-top: 0.75rem;">← Назад</button>
+            <h1>📝 Регистрация</h1>
+            <p class="subtitle">Создайте новый аккаунт</p>
+            <input type="text" id="reg-nickname" placeholder="Никнейм" maxlength="20">
+            <input type="password" id="reg-password" placeholder="Пароль (минимум 4 символа)">
+            <input type="password" id="reg-password-confirm" placeholder="Подтвердите пароль">
+            <input type="email" id="reg-email" placeholder="Email (опционально)">
+            <div id="reg-error" class="error"></div>
+            <button class="btn-join" id="register-btn">Зарегистрироваться</button>
+            <button class="btn-link" id="switch-to-login">← Уже есть аккаунт? Войти</button>
         </div>
     </div>
 
     <!-- Chat Screen -->
     <div id="chat-screen">
-        <!-- Header -->
         <div class="chat-header">
             <div class="left">
                 <span class="title">💬 Global Chat</span>
@@ -1192,18 +743,14 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Connection Status -->
         <div class="connection-status" id="connection-status">⚠️ Нет соединения с сервером...</div>
-
-        <!-- Messages -->
         <div class="messages-container" id="messages-container"></div>
 
-        <!-- Input -->
         <div class="input-area">
             <div class="input-wrapper">
                 <button class="icon-btn" id="attach-btn" title="Прикрепить файл"><i class="fas fa-paperclip"></i></button>
                 <button class="icon-btn" id="image-btn" title="Прикрепить изображение"><i class="fas fa-image"></i></button>
-                <input type="text" id="message-input" placeholder="Введите сообщение..." disabled>
+                <input type="text" id="message-input" placeholder="Введите сообщение... (используйте @ник для упоминания)" disabled>
             </div>
             <button class="btn-send" id="send-btn" disabled>Отправить</button>
         </div>
@@ -1215,10 +762,10 @@ HTML_TEMPLATE = """
         <img class="modal-content" id="modal-image">
     </div>
 
-    <!-- Profile Modal -->
+    <!-- Profile Modal (self) -->
     <div class="modal profile-modal" id="profile-modal">
         <div class="modal-content">
-            <h2>👤 Профиль</h2>
+            <h2>👤 Мой профиль</h2>
             <div class="avatar-upload">
                 <img id="profile-avatar" class="current-avatar" src="" alt="Avatar">
                 <div>
@@ -1242,15 +789,28 @@ HTML_TEMPLATE = """
                 <input type="email" id="profile-email" placeholder="email@example.com">
             </div>
             <div class="form-group">
-                <label>Пароль</label>
-                <input type="password" id="profile-password" placeholder="Новый пароль (оставьте пустым для удаления)">
-                <span style="color: #6e6e80; font-size: 0.7rem;">Оставьте пустым, чтобы удалить пароль</span>
+                <label>Изменить пароль</label>
+                <input type="password" id="profile-password" placeholder="Новый пароль (минимум 4 символа)">
+                <span style="color: #6e6e80; font-size: 0.7rem;">Оставьте пустым, чтобы не менять</span>
             </div>
             <div class="btn-group">
                 <button class="btn btn-primary" id="profile-save-btn">💾 Сохранить</button>
                 <button class="btn btn-secondary" id="profile-close-btn">Закрыть</button>
             </div>
             <div id="profile-message"></div>
+        </div>
+    </div>
+
+    <!-- User Profile View Modal (other users) -->
+    <div class="modal user-profile-modal" id="user-profile-modal">
+        <div class="modal-content">
+            <img id="user-profile-avatar" class="big-avatar" src="" alt="Avatar">
+            <div class="user-name" id="user-profile-name">—</div>
+            <div class="user-status" id="user-profile-status">—</div>
+            <div class="user-info" id="user-profile-info"></div>
+            <div class="user-contact" id="user-profile-phone"><i class="fas fa-phone"></i> <span>—</span></div>
+            <div class="user-contact" id="user-profile-email"><i class="fas fa-envelope"></i> <span>—</span></div>
+            <button class="btn btn-secondary btn-close" id="user-profile-close">Закрыть</button>
         </div>
     </div>
 
@@ -1270,18 +830,32 @@ HTML_TEMPLATE = """
             reconnectAttempts: 0,
             maxReconnectAttempts: 10,
             profile: null,
+            editingMessageId: null,
         };
 
         // ============================================
         // DOM REFS
         // ============================================
         const $ = id => document.getElementById(id);
+        
+        // Login/Register
         const loginScreen = $('login-screen');
         const registerScreen = $('register-screen');
         const chatScreen = $('chat-screen');
-        const nicknameInput = $('nickname-input');
-        const joinBtn = $('join-btn');
+        const loginNickname = $('login-nickname');
+        const loginPassword = $('login-password');
+        const loginBtn = $('login-btn');
         const loginError = $('login-error');
+        const switchToRegister = $('switch-to-register');
+        const switchToLogin = $('switch-to-login');
+        const regNickname = $('reg-nickname');
+        const regPassword = $('reg-password');
+        const regPasswordConfirm = $('reg-password-confirm');
+        const regEmail = $('reg-email');
+        const regBtn = $('register-btn');
+        const regError = $('reg-error');
+        
+        // Chat
         const messagesContainer = $('messages-container');
         const messageInput = $('message-input');
         const sendBtn = $('send-btn');
@@ -1294,6 +868,8 @@ HTML_TEMPLATE = """
         const fileInput = $('file-input');
         const imageInput = $('image-input');
         const profileBtn = $('profile-btn');
+        
+        // Profile Modal
         const profileModal = $('profile-modal');
         const profileCloseBtn = $('profile-close-btn');
         const profileSaveBtn = $('profile-save-btn');
@@ -1304,16 +880,21 @@ HTML_TEMPLATE = """
         const profilePassword = $('profile-password');
         const profileMessage = $('profile-message');
         const avatarInput = $('avatar-input');
+        
+        // User Profile View
+        const userProfileModal = $('user-profile-modal');
+        const userProfileClose = $('user-profile-close');
+        const userProfileAvatar = $('user-profile-avatar');
+        const userProfileName = $('user-profile-name');
+        const userProfileStatus = $('user-profile-status');
+        const userProfileInfo = $('user-profile-info');
+        const userProfilePhone = $('user-profile-phone');
+        const userProfileEmail = $('user-profile-email');
+        
+        // Image Modal
         const imageModal = $('image-modal');
         const modalImage = $('modal-image');
         const modalClose = $('modal-close');
-        const showRegisterBtn = $('show-register-btn');
-        const registerBtn = $('register-btn');
-        const backToLoginBtn = $('back-to-login-btn');
-        const regNickname = $('reg-nickname');
-        const regPassword = $('reg-password');
-        const regEmail = $('reg-email');
-        const regError = $('reg-error');
 
         // ============================================
         // UTILITIES
@@ -1329,6 +910,11 @@ HTML_TEMPLATE = """
         function formatTime(timestamp) {
             const date = new Date(timestamp * 1000);
             return date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        }
+
+        function formatDate(timestamp) {
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
         }
 
         function formatFileSize(bytes) {
@@ -1365,19 +951,44 @@ HTML_TEMPLATE = """
             return colors[ext] || '#6e6e80';
         }
 
+        function extractMentions(text) {
+            const mentions = [];
+            const regex = /@(\w+)/g;
+            let match;
+            while ((match = regex.exec(text)) !== null) {
+                mentions.push(match[1]);
+            }
+            return mentions;
+        }
+
+        function showToast(title, text, duration = 5000) {
+            const existing = document.querySelector('.toast');
+            if (existing) existing.remove();
+            
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            toast.innerHTML = `
+                <div class="toast-title">${title}</div>
+                <div class="toast-text">${text}</div>
+            `;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), duration);
+        }
+
         // ============================================
         // RENDER MESSAGE
         // ============================================
         function renderMessage(message) {
             const div = document.createElement('div');
             div.className = `message ${message.is_system ? 'system' : ''}`;
+            div.dataset.messageId = message.id;
             
             // Avatar
             const avatar = document.createElement('div');
             avatar.className = 'avatar';
             
             if (!message.is_system) {
-                if (state.profile && state.profile.nickname === message.nickname && state.profile.avatar) {
+                if (message.nickname === state.nickname && state.profile && state.profile.avatar) {
                     const img = document.createElement('img');
                     img.src = state.profile.avatar;
                     avatar.appendChild(img);
@@ -1385,6 +996,8 @@ HTML_TEMPLATE = """
                     avatar.textContent = message.nickname.charAt(0).toUpperCase();
                     avatar.style.background = getColorFromString(message.nickname);
                 }
+                avatar.title = `Нажмите для просмотра профиля ${message.nickname}`;
+                avatar.onclick = () => viewUserProfile(message.nickname);
             }
             div.appendChild(avatar);
 
@@ -1400,6 +1013,7 @@ HTML_TEMPLATE = """
                 name.className = 'msg-nickname';
                 name.textContent = message.nickname;
                 name.style.color = getColorFromString(message.nickname);
+                name.onclick = () => viewUserProfile(message.nickname);
                 header.appendChild(name);
                 
                 const time = document.createElement('span');
@@ -1407,16 +1021,39 @@ HTML_TEMPLATE = """
                 time.textContent = formatTime(message.timestamp);
                 header.appendChild(time);
                 
+                if (message.edited) {
+                    const edited = document.createElement('span');
+                    edited.className = 'msg-edit-indicator';
+                    edited.textContent = '(ред.)';
+                    header.appendChild(edited);
+                }
+                
                 content.appendChild(header);
             }
 
             const text = document.createElement('div');
-            text.className = 'msg-text';
-            text.textContent = message.text;
+            text.className = `msg-text ${message.deleted ? 'deleted' : ''}`;
+            
+            if (message.deleted) {
+                text.textContent = message.text;
+            } else {
+                // Обработка упоминаний
+                const parts = message.text.split(/(@\w+)/g);
+                for (const part of parts) {
+                    if (part.startsWith('@')) {
+                        const mention = document.createElement('span');
+                        mention.className = 'mention-highlight';
+                        mention.textContent = part;
+                        text.appendChild(mention);
+                    } else {
+                        text.appendChild(document.createTextNode(part));
+                    }
+                }
+            }
             content.appendChild(text);
 
             // File
-            if (message.file) {
+            if (message.file && !message.deleted) {
                 const fileDiv = document.createElement('div');
                 fileDiv.className = 'file-attachment';
                 
@@ -1454,6 +1091,36 @@ HTML_TEMPLATE = """
                 content.appendChild(fileDiv);
             }
 
+            // Actions (only for own messages, not system, not deleted)
+            if (!message.is_system && message.nickname === state.nickname && !message.deleted) {
+                const actions = document.createElement('div');
+                actions.className = 'msg-actions';
+                
+                const editBtn = document.createElement('button');
+                editBtn.className = 'edit-btn';
+                editBtn.innerHTML = '<i class="fas fa-edit"></i>';
+                editBtn.title = 'Редактировать';
+                editBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    startEditing(message.id, message.text);
+                };
+                actions.appendChild(editBtn);
+                
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'delete-btn';
+                deleteBtn.innerHTML = '<i class="fas fa-trash"></i>';
+                deleteBtn.title = 'Удалить';
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (confirm('Удалить это сообщение?')) {
+                        sendMessage({ type: 'delete', message_id: message.id });
+                    }
+                };
+                actions.appendChild(deleteBtn);
+                
+                content.appendChild(actions);
+            }
+
             div.appendChild(content);
             return div;
         }
@@ -1467,8 +1134,62 @@ HTML_TEMPLATE = """
         }
 
         function appendMessage(message) {
+            // Проверяем, не существует ли уже такое сообщение
+            const existing = messagesContainer.querySelector(`[data-message-id="${message.id}"]`);
+            if (existing) {
+                existing.replaceWith(renderMessage(message));
+                return;
+            }
             messagesContainer.appendChild(renderMessage(message));
             scrollToBottom();
+            
+            // Проверяем упоминания
+            if (!message.is_system && message.text) {
+                const mentions = extractMentions(message.text);
+                if (mentions.includes(state.nickname)) {
+                    showToast('🔔 Вас упомянули', `${message.nickname}: ${message.text}`);
+                    // Подсвечиваем сообщение
+                    const msgEl = messagesContainer.querySelector(`[data-message-id="${message.id}"]`);
+                    if (msgEl) {
+                        msgEl.classList.add('mentioned');
+                        setTimeout(() => msgEl.classList.remove('mentioned'), 3000);
+                    }
+                }
+            }
+        }
+
+        function updateMessage(message) {
+            const existing = messagesContainer.querySelector(`[data-message-id="${message.id}"]`);
+            if (existing) {
+                existing.replaceWith(renderMessage(message));
+            }
+        }
+
+        function deleteMessage(message) {
+            const existing = messagesContainer.querySelector(`[data-message-id="${message.id}"]`);
+            if (existing) {
+                existing.replaceWith(renderMessage(message));
+            }
+        }
+
+        // ============================================
+        // EDITING
+        // ============================================
+        function startEditing(messageId, currentText) {
+            state.editingMessageId = messageId;
+            messageInput.value = currentText;
+            messageInput.focus();
+            messageInput.classList.add('editing');
+            sendBtn.textContent = '💾 Сохранить';
+            sendBtn.style.background = 'linear-gradient(135deg, #f59e0b, #fbbf24)';
+        }
+
+        function cancelEditing() {
+            state.editingMessageId = null;
+            messageInput.value = '';
+            messageInput.classList.remove('editing');
+            sendBtn.textContent = 'Отправить';
+            sendBtn.style.background = '';
         }
 
         // ============================================
@@ -1482,6 +1203,36 @@ HTML_TEMPLATE = """
         modalClose.onclick = () => imageModal.classList.remove('active');
         imageModal.onclick = (e) => {
             if (e.target === imageModal) imageModal.classList.remove('active');
+        };
+
+        // ============================================
+        // USER PROFILE VIEW
+        // ============================================
+        async function viewUserProfile(nickname) {
+            try {
+                const response = await fetch(`/api/profile/${encodeURIComponent(nickname)}`);
+                if (!response.ok) throw new Error('User not found');
+                const profile = await response.json();
+                
+                userProfileAvatar.src = profile.avatar || `data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="80" height="80"%3E%3Ccircle cx="40" cy="40" r="40" fill="%232a2a3a"/%3E%3Ctext x="40" y="48" text-anchor="middle" fill="%23e4e4e7" font-size="36" font-weight="bold"%3E${nickname.charAt(0).toUpperCase()}%3C/text%3E%3C/svg%3E`;
+                userProfileName.textContent = nickname;
+                userProfileName.style.color = getColorFromString(nickname);
+                userProfileStatus.textContent = profile.is_online ? '🟢 Онлайн' : '⚫ Офлайн';
+                userProfileStatus.style.color = profile.is_online ? '#4ade80' : '#6e6e80';
+                userProfileInfo.textContent = profile.info || 'Информация не указана';
+                userProfilePhone.querySelector('span').textContent = profile.phone || 'Не указан';
+                userProfileEmail.querySelector('span').textContent = profile.email || 'Не указан';
+                
+                userProfileModal.classList.add('active');
+            } catch (error) {
+                console.error('Error loading profile:', error);
+                showToast('❌ Ошибка', 'Не удалось загрузить профиль');
+            }
+        }
+
+        userProfileClose.onclick = () => userProfileModal.classList.remove('active');
+        userProfileModal.onclick = (e) => {
+            if (e.target === userProfileModal) userProfileModal.classList.remove('active');
         };
 
         // ============================================
@@ -1513,7 +1264,7 @@ HTML_TEMPLATE = """
                 state.reconnectAttempts = 0;
                 updateConnectionStatus(true);
                 enableChat(true);
-                sendMessage({ type: 'join', nickname: state.nickname });
+                sendMessage({ type: 'join', nickname: state.nickname, password: state.password || '' });
             };
 
             state.ws.onmessage = function(event) {
@@ -1563,11 +1314,21 @@ HTML_TEMPLATE = """
                 case 'message':
                     appendMessage(data.message);
                     break;
+                case 'delete':
+                    deleteMessage(data.message);
+                    break;
+                case 'edit':
+                    updateMessage(data.message);
+                    break;
                 case 'online_count':
                     onlineCount.textContent = data.count;
                     break;
+                case 'mention':
+                    showToast('🔔 Вас упомянули', `${data.from}: ${data.text}`);
+                    break;
                 case 'error':
                     console.error('Server error:', data.message);
+                    showToast('❌ Ошибка', data.message);
                     break;
             }
         }
@@ -1591,7 +1352,7 @@ HTML_TEMPLATE = """
 
                     if (!response.ok) {
                         const error = await response.json();
-                        console.error('Upload error:', error);
+                        showToast('❌ Ошибка загрузки', error.detail || 'Не удалось загрузить файл');
                         continue;
                     }
 
@@ -1604,6 +1365,7 @@ HTML_TEMPLATE = """
 
                 } catch (error) {
                     console.error('Upload error:', error);
+                    showToast('❌ Ошибка', 'Не удалось загрузить файл');
                 }
             }
         }
@@ -1636,13 +1398,10 @@ HTML_TEMPLATE = """
                 info: profileInfo.value,
                 phone: profilePhone.value,
                 email: profileEmail.value,
-                password: profilePassword.value
             };
 
             let success = true;
             for (const [field, value] of Object.entries(updates)) {
-                if (field === 'password' && value === '') continue;
-                
                 const formData = new FormData();
                 formData.append('nickname', state.nickname);
                 formData.append('field', field);
@@ -1656,6 +1415,30 @@ HTML_TEMPLATE = """
                     if (!response.ok) {
                         success = false;
                     }
+                } catch (error) {
+                    success = false;
+                }
+            }
+
+            // Изменение пароля
+            const newPassword = profilePassword.value.trim();
+            if (newPassword) {
+                if (newPassword.length < 4) {
+                    profileMessage.textContent = '❌ Пароль должен быть минимум 4 символа';
+                    profileMessage.style.color = '#f87171';
+                    return;
+                }
+                const formData = new FormData();
+                formData.append('nickname', state.nickname);
+                formData.append('field', 'password');
+                formData.append('value', newPassword);
+                
+                try {
+                    const response = await fetch('/api/profile/update', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    if (!response.ok) success = false;
                 } catch (error) {
                     success = false;
                 }
@@ -1686,7 +1469,7 @@ HTML_TEMPLATE = """
 
                 if (!response.ok) {
                     const error = await response.json();
-                    console.error('Avatar upload error:', error);
+                    showToast('❌ Ошибка', error.detail || 'Не удалось загрузить аватар');
                     return;
                 }
 
@@ -1700,6 +1483,7 @@ HTML_TEMPLATE = """
 
             } catch (error) {
                 console.error('Avatar upload error:', error);
+                showToast('❌ Ошибка', 'Не удалось загрузить аватар');
             }
         }
 
@@ -1727,79 +1511,12 @@ HTML_TEMPLATE = """
         }
 
         // ============================================
-        // JOIN / LEAVE
+        // AUTH
         // ============================================
-        function joinChat(nickname) {
-            state.nickname = nickname;
-            currentNickname.textContent = nickname;
+        function handleLogin() {
+            const nickname = loginNickname.value.trim();
+            const password = loginPassword.value;
 
-            loginScreen.style.display = 'none';
-            registerScreen.style.display = 'none';
-            chatScreen.style.display = 'flex';
-
-            loadProfile(nickname);
-            connectWebSocket();
-        }
-
-        function leaveChat() {
-            if (state.ws) state.ws.close();
-            state.connected = false;
-            state.reconnecting = false;
-            state.nickname = '';
-
-            chatScreen.style.display = 'none';
-            loginScreen.style.display = 'flex';
-            nicknameInput.value = '';
-            nicknameInput.focus();
-        }
-
-        // ============================================
-        // REGISTER
-        // ============================================
-        async function registerUser() {
-            const nickname = regNickname.value.trim();
-            const password = regPassword.value;
-            const email = regEmail.value.trim();
-
-            if (!nickname) {
-                regError.textContent = 'Введите никнейм';
-                regError.style.display = 'block';
-                return;
-            }
-
-            if (nickname.toLowerCase() === 'system') {
-                regError.textContent = 'Этот никнейм зарезервирован';
-                regError.style.display = 'block';
-                return;
-            }
-
-            regError.style.display = 'none';
-            state.nickname = nickname;
-            
-            connectWebSocket();
-            const checkConnection = setInterval(() => {
-                if (state.connected) {
-                    clearInterval(checkConnection);
-                    sendMessage({ 
-                        type: 'join', 
-                        nickname: nickname,
-                        password: password || undefined,
-                        email: email || undefined
-                    });
-                    loginScreen.style.display = 'none';
-                    registerScreen.style.display = 'none';
-                    chatScreen.style.display = 'flex';
-                    currentNickname.textContent = nickname;
-                    loadProfile(nickname);
-                }
-            }, 100);
-        }
-
-        // ============================================
-        // EVENT LISTENERS
-        // ============================================
-        joinBtn.addEventListener('click', () => {
-            const nickname = nicknameInput.value.trim();
             if (!nickname) {
                 loginError.textContent = 'Введите никнейм';
                 loginError.style.display = 'block';
@@ -1810,26 +1527,168 @@ HTML_TEMPLATE = """
                 loginError.style.display = 'block';
                 return;
             }
-            loginError.style.display = 'none';
-            joinChat(nickname);
-        });
-
-        nicknameInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') joinBtn.click();
-        });
-
-        sendBtn.addEventListener('click', () => {
-            const text = messageInput.value.trim();
-            if (text) {
-                sendMessage({ type: 'message', text: text });
-                messageInput.value = '';
+            if (!password) {
+                loginError.textContent = 'Введите пароль';
+                loginError.style.display = 'block';
+                return;
             }
+
+            loginError.style.display = 'none';
+            state.nickname = nickname;
+            state.password = password;
+
+            loginScreen.style.display = 'none';
+            registerScreen.style.display = 'none';
+            chatScreen.style.display = 'flex';
+            currentNickname.textContent = nickname;
+
+            loadProfile(nickname);
+            connectWebSocket();
+        }
+
+        function handleRegister() {
+            const nickname = regNickname.value.trim();
+            const password = regPassword.value;
+            const passwordConfirm = regPasswordConfirm.value;
+            const email = regEmail.value.trim();
+
+            if (!nickname) {
+                regError.textContent = 'Введите никнейм';
+                regError.style.display = 'block';
+                return;
+            }
+            if (nickname.toLowerCase() === 'system') {
+                regError.textContent = 'Этот никнейм зарезервирован';
+                regError.style.display = 'block';
+                return;
+            }
+            if (password.length < 4) {
+                regError.textContent = 'Пароль должен быть минимум 4 символа';
+                regError.style.display = 'block';
+                return;
+            }
+            if (password !== passwordConfirm) {
+                regError.textContent = 'Пароли не совпадают';
+                regError.style.display = 'block';
+                return;
+            }
+
+            regError.style.display = 'none';
+            state.nickname = nickname;
+            state.password = password;
+
+            loginScreen.style.display = 'none';
+            registerScreen.style.display = 'none';
+            chatScreen.style.display = 'flex';
+            currentNickname.textContent = nickname;
+
+            loadProfile(nickname);
+            connectWebSocket();
+        }
+
+        function leaveChat() {
+            if (state.ws) state.ws.close();
+            state.connected = false;
+            state.reconnecting = false;
+            state.nickname = '';
+            state.password = '';
+            state.editingMessageId = null;
+
+            chatScreen.style.display = 'none';
+            loginScreen.style.display = 'flex';
+            loginNickname.value = '';
+            loginPassword.value = '';
+            loginNickname.focus();
+            cancelEditing();
+        }
+
+        // ============================================
+        // SEND MESSAGE
+        // ============================================
+        function sendChatMessage() {
+            let text = messageInput.value.trim();
+            if (!text) return;
+
+            // Проверяем, редактируем ли мы сообщение
+            if (state.editingMessageId) {
+                sendMessage({
+                    type: 'edit',
+                    message_id: state.editingMessageId,
+                    text: text
+                });
+                cancelEditing();
+                messageInput.value = '';
+                return;
+            }
+
+            // Проверяем упоминания
+            const mentions = extractMentions(text);
+            for (const mention of mentions) {
+                if (mention === 'all') {
+                    sendMessage({
+                        type: 'mention',
+                        target: 'all',
+                        text: text
+                    });
+                    showToast('🔔 Уведомление', 'Вы упомянули всех (@all)');
+                } else if (mention !== state.nickname) {
+                    sendMessage({
+                        type: 'mention',
+                        target: mention,
+                        text: text
+                    });
+                }
+            }
+
+            sendMessage({ type: 'message', text: text });
+            messageInput.value = '';
+        }
+
+        // ============================================
+        // EVENT LISTENERS
+        // ============================================
+        // Login/Register
+        loginBtn.addEventListener('click', handleLogin);
+        loginNickname.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') loginBtn.click();
+        });
+        loginPassword.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') loginBtn.click();
         });
 
+        switchToRegister.addEventListener('click', () => {
+            loginScreen.style.display = 'none';
+            registerScreen.style.display = 'flex';
+            regNickname.focus();
+        });
+
+        switchToLogin.addEventListener('click', () => {
+            registerScreen.style.display = 'none';
+            loginScreen.style.display = 'flex';
+            loginNickname.focus();
+        });
+
+        regBtn.addEventListener('click', handleRegister);
+        regNickname.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') regPassword.focus();
+        });
+        regPassword.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') regPasswordConfirm.focus();
+        });
+        regPasswordConfirm.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') regBtn.click();
+        });
+
+        // Chat
+        sendBtn.addEventListener('click', sendChatMessage);
         messageInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                sendBtn.click();
+                sendChatMessage();
+            }
+            if (e.key === 'Escape') {
+                cancelEditing();
+                messageInput.blur();
             }
         });
 
@@ -1852,6 +1711,7 @@ HTML_TEMPLATE = """
             }
         });
 
+        // Profile
         profileBtn.addEventListener('click', () => {
             profileModal.classList.add('active');
             updateProfileUI();
@@ -1874,27 +1734,12 @@ HTML_TEMPLATE = """
             }
         });
 
-        showRegisterBtn.addEventListener('click', () => {
-            loginScreen.style.display = 'none';
-            registerScreen.style.display = 'flex';
-        });
-
-        backToLoginBtn.addEventListener('click', () => {
-            registerScreen.style.display = 'none';
-            loginScreen.style.display = 'flex';
-        });
-
-        registerBtn.addEventListener('click', registerUser);
-
-        regNickname.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') registerBtn.click();
-        });
-
         // ============================================
         // INIT
         // ============================================
-        nicknameInput.focus();
-        console.log('💬 Global Chat loaded!');
+        loginNickname.focus();
+        console.log('💬 Global Chat Pro loaded!');
+        console.log('✨ Features: Auth, Mentions, Delete, Edit, Profile View');
     </script>
 </body>
 </html>
